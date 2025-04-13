@@ -1,9 +1,13 @@
 # conf/training/default.yaml
 
 # --- 数据分割参数 ---
+spilt_group: ['train', 'val', 'test']
 validation_split: 0.2
 test_split: 0.1  # 预留用于最终测试的数据比例
 
+# 重采样
+wind_compression : 20  # 风速压缩比例
+flow_boradcast:   600 # 流量预报比例
 # --- 特征配置 ---
 use_scaler: true  # 是否使用标准化
 

@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 def train_and_predict_lstm(
     cfg: DictConfig,
-    low_dim_feature_paths: Dict[str, Dict[str, str]],
+    low_dim_data_paths: Dict[str, Dict[str, str]],
     # target_field_name: str,              # 目标特征名 (e.g., 'salinity')
     # input_feature_info: Dict[str, Dict], # 包含节点数: {'salinity': {'num_nodes': 100}, 'wind_flow': {'num_nodes': 64}}
     # --- 目录和模式 ---
@@ -40,7 +40,7 @@ def train_and_predict_lstm(
 
     # Args:
     #     cfg: Hydra 配置对象。
-    #     low_dim_feature_paths: 包含各特征 BMU 索引文件路径的字典 {feature: {split: path}}。
+    #     low_dim_data_paths: 包含各特征 BMU 索引文件路径的字典 {feature: {split: path}}。
     #     target_field_name: 目标特征的名称。
     #     input_feature_info: 包含每个输入特征信息的字典，至少需要 {'num_nodes': N}。
     #                        特征顺序应与加载/堆叠顺序一致 (target 通常放第一个)。
@@ -61,11 +61,11 @@ def train_and_predict_lstm(
     target_field_name = "salinity"
     # --- MODIFICATION START: Correctly get feature names from the dictionary keys ---
     # feature_names_ordered = [target_field_name] + \
-    #                         [f for f in low_dim_feature_paths.keys() if f != target_field_name]
+    #                         [f for f in low_dim_data_paths.keys() if f != target_field_name]
     # Get actual feature names present in the loaded data dictionary
-    actual_features = list(low_dim_feature_paths.keys())
+    actual_features = list(low_dim_data_paths.keys())
     if target_field_name not in actual_features:
-        logger.error(f"Target field '{target_field_name}' not found in the keys of low_dim_feature_paths: {actual_features}")
+        logger.error(f"Target field '{target_field_name}' not found in the keys of low_dim_data_paths: {actual_features}")
         return {}
     feature_names_ordered = [target_field_name] + [f for f in actual_features if f != target_field_name]
     # --- MODIFICATION END ---
@@ -147,9 +147,9 @@ def train_and_predict_lstm(
             # --- MODIFICATION START: Iterate over the FINAL feature_names_ordered ---
             for i, feature in enumerate(feature_names_ordered): # Use the final ordered list
             # --- MODIFICATION END ---
-                # path = low_dim_feature_paths.get(feature, {}).get(split) # Original logic assumed paths were strings
+                # path = low_dim_data_paths.get(feature, {}).get(split) # Original logic assumed paths were strings
                 # --- Corrected logic from previous step (assuming it's correct) ---
-                path_info = low_dim_feature_paths.get(feature, {}).get(split)
+                path_info = low_dim_data_paths.get(feature, {}).get(split)
                 path_to_load = None
                 if isinstance(path_info, dict):
                     bmu_positions_path = path_info.get('positions')

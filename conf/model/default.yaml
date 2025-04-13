@@ -24,6 +24,7 @@ dimensionality_reduction:
 prediction:
   method: hmm # 可选项: hmm, lstm
   lstm: # 如果 method 是 lstm，保留 LSTM 参数
+      input_type: bmu_rank # 也可以是dv
       hidden_size: 64
       num_layers: 2
       dropout: 0.1

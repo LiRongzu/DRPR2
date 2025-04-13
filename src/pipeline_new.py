@@ -21,7 +21,6 @@ from src.utils.hydra_config import DrprConfig
 from src.evaluation.visualization import plot_time_series_comparison, plot_spatial_rmse
 from src.utils.model_utils import get_device_from_config  
 from src.dimensionality_reduction.som_pytorch import SOMTorch
-# 导入集中化的数据加载函数
 from src.utils.data_loader import load_raw_data, load_mask, load_scaler, load_split_indices
 
 # --- 导入训练函数 ---
@@ -31,33 +30,22 @@ from src.training.train_lstm import train_and_predict_lstm
 from src.training.train_pca import train_and_transform_pca
 from src.training.train_autoencoder import train_and_transform_ae
 from src.reconstruction.reconstruct_bmu import reconstruct_from_bmu # 用于基于 SOM 的重建
-# 需要一个用于 PCA/AE 基于逆变换的重建函数
+
 logger = logging.getLogger(__name__)
 
-# --- 设置全局随机种子函数 ---
 def set_global_seeds(seed):
-    """
-    设置所有随机数生成器的种子，确保结果可重现
-    
-    Args:
-        seed: 随机种子值
-    """
     if seed is None:
         logger.warning("未提供随机种子，结果可能不可重现")
         return
         
     logger.info(f"设置全局随机种子: {seed}")
     
-    # Python 内置 random 模块
     random.seed(seed)
     
-    # NumPy
     np.random.seed(seed)
     
-    # PyTorch
     torch.manual_seed(seed)
     
-    # 如果有CUDA可用，也设置CUDA种子
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
@@ -105,20 +93,19 @@ def run_dimensionality_reduction(cfg: DictConfig) -> Dict[str, Any]:
     os.makedirs(transformed_data_dir, exist_ok=True)
 
     if method == 'som':
-        # 如果使用 HMM，SOM 需要特殊处理状态与观测
-        # 状态 SOM (Salinity)
         som_state_results = train_single_feature_som(cfg, feature_name=target_field_dr)
         if not som_state_results: raise RuntimeError("状态 SOM 训练失败")
         results['som_state'] = som_state_results
 
-        # 生成距离向量 (如果 LSTM 使用) 或 BMU 索引/秩
-        # 此逻辑可能需要根据 LSTM/HMM 的消耗进行细化
         # 目前假设 BMU 索引是 HMM 的主要输出
         # 如果 LSTM 需要，可能需要单独生成距离向量
         # HMM 输入需要 BMU 文件路径
         # bmu_paths 字典在 som_state_results['bmu_paths'] 中
+        
         bmu_paths_state = som_state_results.get('bmu_paths', {})
         results['low_dim_data_paths'] = {split: p.get('positions') for split, p in bmu_paths_state.items() if p.get('positions')}
+        results['low_dim_dv_paths'] = som_state_results.get('dv_paths', {})
+
         results['model_path'] = som_state_results.get('model_path')
         # 在此设置中，SOM 不使用单独的高维输入缩放器
 
@@ -241,20 +228,30 @@ def run_prediction(cfg: DictConfig, dr_results: Dict[str, Any]) -> Dict[str, Any
              results['success'] = False; return results
 
     elif method == 'lstm':
+        dr_method = dr_results['method']
+        lstm_input_type = cfg.model.prediction.lstm.get('input_type')
+
         model_save_dir_lstm = os.path.join(pred_model_dir) # 在此保存 LSTM 模型
         scaler_save_path_lstm = os.path.join(config.paths.processed_data_dir, f"{dr_results['method']}_lstm_input_scaler.pkl")
         pred_output_dir_lstm = os.path.join(pred_output_dir) # 在此保存预测
 
-        pred_results = train_and_predict_lstm(
-            cfg,
-            low_dim_data_paths=low_dim_data_paths, # 来自降维步骤
-            model_save_dir=model_save_dir_lstm,
-            scaler_save_path=scaler_save_path_lstm,
-            prediction_save_dir=pred_output_dir_lstm
-            # prediction_filename_pattern 可以使用默认值
-        )
-        if pred_results: # 合并结果
-             results.update(pred_results)
+        if lstm_input_type == 'bmu_rank':
+            pred_results = train_and_predict_lstm(
+                cfg,
+                low_dim_data_paths=low_dim_data_paths, # 来自降维步骤
+                model_save_dir=model_save_dir_lstm,
+                scaler_save_path=scaler_save_path_lstm,
+                prediction_save_dir=pred_output_dir_lstm
+                # prediction_filename_pattern 可以使用默认值
+            )
+            if pred_results: # 合并结果
+                results.update(pred_results)
+
+                
+        elif lstm_input_type == 'dv':
+            logger.error(f"使用 LSTM 处理来自 {dr_method} 的离散低维输入的逻辑尚未实现。需要修改相关代码。")
+            results['success'] = False; return results
+            
 
     else:
         logger.error(f"未知的预测方法: {method}")

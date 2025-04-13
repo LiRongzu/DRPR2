@@ -651,6 +651,7 @@ class SOMTorch(nn.Module):
         model.eval() # 设置为评估模式
         logging.info(f"SOM 模型已通过类加载方法从 {path} 加载。特征名: {model.feature_name}")
         return model
+    
     def compute_distance_vectors(self, data):
         """
         计算输入数据到所有SOM原型向量的距离向量

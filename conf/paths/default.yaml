@@ -6,7 +6,8 @@ hydra_run_dir: ${hydra:runtime.output_dir} # 获取当前运行目录
 # 定义输出子目录结构
 models_base_dir: ${paths.hydra_run_dir}/models
 params_base_dir: ${paths.hydra_run_dir}/params
-bmu_base_dir: ${paths.hydra_run_dir}/bmu        # 这是BMU输出目录
+bmu_base_dir: ${paths.hydra_run_dir}/bmu
+dv_base_dir: ${paths.hydra_run_dir}/dv        # 这是BMU输出目录
 predictions_base_dir: ${paths.hydra_run_dir}/predictions
 reconstructions_base_dir: ${paths.hydra_run_dir}/reconstructions
 evaluation_base_dir: ${paths.hydra_run_dir}/evaluation
@@ -15,7 +16,9 @@ evaluation_base_dir: ${paths.hydra_run_dir}/evaluation
 som_models_dir: ${paths.models_base_dir}/som
 hmm_params_dir: ${paths.params_base_dir}/hmm
 reconstructed_bmu_dir: ${paths.reconstructions_base_dir}/bmu
+reconstructed_dv_dir: ${paths.reconstructions_base_dir}/dv
 predicted_states_dir: ${paths.predictions_base_dir}/hmm
+predicted_dv_dir: ${paths.predictions_base_dir}/dv
 lstm_models_dir: ${paths.models_base_dir}/lstm  # <--- 在这里添加定义
 
 # --- Standard File Names (for reference or direct use) ---
