@@ -1,0 +1,29 @@
+paths:
+  raw_data_dir: ${project.data_dir}/raw
+  processed_data_dir: ${project.data_dir}/processed
+  distance_vectors_dir: ${project.data_dir}/processed/distance_vectors
+
+  # 盐度数据
+  salt:
+    data: ${project.data_dir}/raw/salt.npy
+    lonlat: ${project.data_dir}/raw/salt_lonlat.npy
+    grid: ${project.data_dir}/raw/salt_grid.npy
+    lonlat_grid: ${project.data_dir}/raw/salt_lonlat_grid.npy
+
+  # 网格数据
+  mesh:
+    vertices: ${project.data_dir}/raw/vertices.npy
+    triangles: ${project.data_dir}/raw/triangles.npy
+
+  # 风场数据
+  wind:
+    data: ${project.data_dir}/raw/wind.npy
+    lonlat: ${project.data_dir}/raw/wind_lonlat.npy
+
+  # 流量数据
+  flow: ${project.data_dir}/raw/flow.npy
+
+  # 模型保存
+  models:
+    som: ${project.result_dir}/som_model.pkl
+    lstm: ${project.result_dir}/lstm_model.pt

@@ -1,0 +1,84 @@
+# conf/model/default.yaml
+# --- 选择降维方法 ---
+dimensionality_reduction:
+  method: som # 可选项: som, pca, autoencoder
+  som: # 如果 method 是 som，保留 SOM 特定参数
+    # map_size 现在在 training 配置中
+    learning_rate: 0.5
+    neighborhood_size: null
+    seed: 42
+    training:
+      save_frequency: 10
+      early_stopping: true
+      patience: 5
+  pca: # 添加 PCA 特定参数
+     n_components: 20 # 示例值
+  autoencoder: # 添加 Autoencoder 特定参数
+     encoding_dim: 15 # 示例值
+     hidden_layers: [64, 32] # 示例值
+     activation: 'relu'
+     dropout_rate: 0.1
+     batch_size: 64
+
+# --- 选择预测方法 ---
+prediction:
+  method: hmm # 可选项: hmm, lstm
+  lstm: # 如果 method 是 lstm，保留 LSTM 参数
+    hidden_size: 64
+    num_layers: 2
+    dropout: 0.1
+    batch_size: 32
+    sequence_length: 10
+    # target_field 不再那么相关，LSTM 预测低维状态
+  hmm: # 如果 method 是 hmm，保留 HMM 参数
+    n_states: 10
+    observation_features: ["wind", "flow"] # 对于观测 SOM/BMU 仍然需要
+    smoothing_epsilon: 1.0e-7
+    # --- 新增：添加 HMM 输入类型标志 ---
+    input_type: bmu_rank # 可选项: bmu_rank, continuous (用于 PCA/AE) - 如果是 'continuous'，需要修改 HMM 代码
+  ghmm:
+    model_type: gaussian   # <--- 新增或修改：指定模型类型 ('categorical' or 'gaussian')
+    n_components: 15      # <--- GaussianHMM 的隐状态数量
+    covariance_type: diag # <--- GaussianHMM 的协方差类型 ('spherical', 'diag', 'full', 'tied')
+    n_iter: 100           # <--- GaussianHMM 训练迭代次数
+    tol: 0.001            # <--- GaussianHMM 收敛阈值
+    # random_state: ${training.random_seed} # 可以沿用全局种子
+    smoothing_epsilon: 1e-7 # 对于 CategoricalHMM 可能需要，GaussianHMM 可能不需要
+    observation_features: [salinity] # 对于 GaussianHMM，这可能指代低维向量本身，不再是独立的观测SOM
+    # input_type: continuous # 可以明确指定，或者根据 model_type 推断
+device:
+  use_gpu: true
+  cuda_device: "cuda:0"
+# # --- 降维配置 ---
+# som:
+#   # map_size 定义已移除，使用training/default.yaml中的定义
+#   learning_rate: 0.5
+#   neighborhood_size: null  # 使用默认值
+#   seed: 42
+#   training:
+#     save_frequency: 10
+#     early_stopping: true
+#     patience: 5
+
+# # --- 其他模型配置 ---
+# device:
+#   use_gpu: true
+#   cuda_device: "cuda:0"
+
+# # --- 预测配置 ---
+# prediction:
+#   # LSTM 预测配置
+#   lstm:
+#     hidden_size: 64
+#     num_layers: 2
+#     dropout: 0.1
+#     batch_size: 32
+#     sequence_length: 10
+#     target_field: "salinity"
+    
+
+#   hmm:
+#     n_states: 10 # 保持 HMM 状态数 (salinity 模态数)
+#     # 可选项: ["wind", "flow"], ["wind"], ["flow"]
+#     observation_features: ["flow"] # 默认是全条件
+#     smoothing_epsilon: 1.0e-7

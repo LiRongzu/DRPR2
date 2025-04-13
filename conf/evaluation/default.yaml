@@ -1,0 +1,68 @@
+# conf/evaluation/default.yaml
+
+# --- 评估指标配置 ---
+metrics:
+  compute_rmse: true
+  compute_mae: true
+  compute_temporal_mean: true
+  compute_spatial_mean: true
+  time_window: 24  # 天，用于计算移动平均
+  confidence_interval: 0.95  # 置信区间
+
+# --- 空间评估配置 ---
+spatial:
+  plot_grid: true
+  interpolation: "nearest"
+  colormap: "YlOrRd"
+  include_coordinates: true
+  grid_resolution: [50, 50]  # 网格分辨率
+  mask_invalid: true  # 是否遮蔽无效值
+
+# --- 时序评估配置 ---
+temporal:
+  window_size: 7  # 天为单位的移动平均窗口大小
+  plot_moving_average: true
+  include_confidence_interval: true
+  error_band_alpha: 0.2  # 误差带透明度
+  trend_line: true  # 是否显示趋势线
+
+# --- 可视化配置 ---
+visualization:
+  figsize:
+    time_series: [12, 6]
+    spatial: [10, 8]
+    correlation: [8, 8]
+  dpi: 300
+  style: "seaborn"
+  font:
+    family: "sans-serif"
+    size: 10
+  colors:
+    original: "#1f77b4"
+    reconstructed: "#ff7f0e"
+    error: "#d62728"
+  save:
+    format: "png"
+    quality: 95
+  
+# --- 保存配置 ---
+save:
+  root_dir: "."
+  subfolders:
+    metrics: "metrics"
+    figures: "figures"
+    data: "data"
+  formats:
+    metrics: "npy"
+    figures: "png"
+  file_patterns:
+    metrics: "{split}_{metric_name}.{ext}"
+    figures: "{split}_{figure_type}_{timestamp}.{ext}"
+    
+# --- 报告配置 ---
+report:
+  generate: true
+  template: "markdown"
+  include_figures: true
+  include_metrics: true
+  filename: "evaluation_report.md"

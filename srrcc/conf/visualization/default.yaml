@@ -1,0 +1,84 @@
+# conf/visualization/default.yaml
+
+# --- 通用可视化配置 ---
+output_format: "png"  # 输出图像格式
+dpi: 300             # 图像分辨率
+save_figures: true   # 是否保存图像
+show_figures: false  # 是否显示图像
+
+map:
+
+  cartopy_projection: "Mercator"    # Cartopy 投影名称 (例如: PlateCarree, Mercator, LambertConformal, Orthographic)
+  extent: [112.5, 114.5, 21.65, 22.75] # [lon_min, lon_max, lat_min, lat_max] 地图范围
+  central_longitude: 113.5        # 可选，某些投影需要（如 Mercator, LambertConformal）
+  data_crs: "PlateCarree"           # 你的经纬度数据本身的坐标参考系统 (通常是 PlateCarree)
+
+  features:                         # 配置地图特征
+    coastline:
+      scale: "50m"                  # 特征分辨率: '110m', '50m', '10m'
+      linewidth: 0.8
+      color: "black"
+      enabled: false                 # 添加一个开关
+    land:
+      scale: "50m"
+      color: "lightgray"            # 使用 color 或 facecolor
+      # facecolor: "lightgray"      # Cartopy 通常用 facecolor 填充
+      enabled: true
+    ocean:
+      scale: "50m"
+      color: "white"                # 使用 color 或 facecolor
+      # facecolor: "white"
+      enabled: true
+    borders:                        # 国界
+      scale: "50m"
+      linewidth: 0.5
+      color: "gray"
+      enabled: false                # 默认不绘制国界
+    rivers:                         # 河流 (示例, 默认关闭)
+      scale: "10m"
+      color: "blue"
+      linewidth: 0.5
+      enabled: false
+    lakes:                          # 湖泊 (示例, 默认关闭)
+      scale: "10m"
+      color: "lightblue"
+      # facecolor: "lightblue"
+      enabled: false
+
+  gridlines:                        # 配置经纬网格线
+    draw_labels: true               # 是否绘制经纬度标签
+    linewidth: 0.5
+    color: 'gray'
+    alpha: 0.5
+    linestyle: '--'
+    enabled: true
+
+  # --- 保留或调整通用配置 ---
+  mask_color: 'darkgray'            # 用于绘制无效数据的颜色
+  land_color: 'lightgray'           # 可保留，或主要由 features.land.color 控制
+  water_color: 'white'              # 可保留，或主要由 features.ocean.color 控制
+  figsize: [10, 8]                # 图像尺寸 (保持)
+  
+# --- SOM可视化配置 ---
+som:
+  show_component_planes: true
+  show_u_matrix: true
+  colormap: "viridis"
+  
+# --- 时间序列可视化配置 ---
+timeseries:
+  line_style: "-"
+  marker: "."
+  alpha: 0.8
+  grid: true
+  
+# --- 颜色配置 ---
+colors:
+  prediction: "red"
+  ground_truth: "blue"
+  reconstruction: "green"
+  
+# --- 保存配置 ---
+save:
+  dir: "figures"  # 相对于Hydra运行目录的路径
+  format: "{name}_{timestamp}.{ext}"

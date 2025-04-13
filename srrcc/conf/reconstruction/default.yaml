@@ -1,0 +1,27 @@
+# conf/reconstruction/default.yaml
+
+# --- 重建目标配置 ---
+target_field: "salinity"  # 重建目标字段
+output_format: "npy"      # 输出格式
+
+# --- 流形重建配置 ---
+manifold:
+  type: "pca"  # 使用的流形模型类型
+  use_inverse_transform: true  # 使用 inverse_transform 而不是 decode
+
+# --- BMU 重建配置 ---
+bmu:
+  # map_size: ${training.som.map_size}  # 应与训练时使用的地图大小匹配
+  output_original_shape: true  # 是否将输出重塑为原始形状
+  # use_prototypes : false  # 是否使用簇类均值重建方法
+  # --- 选择 SOM 重建方法 ---
+  # 通过此参数控制使用哪种方法将 BMU 序列映射回高维空间
+  # 可选项:
+  #  'weights': 使用 SOM 节点的权重向量 (原始方法，设为默认值)
+  #  'cluster_average': 使用映射到该节点的训练样本的平均值 (新添加的方法)
+  som_reconstruction_method: 'cluster_average'
+# --- 评估配置 ---
+evaluation:
+  enabled: true    # 是否评估重建结果
+  metrics: ["mse", "mae"]  # 要计算的评估指标
+  save_metrics: true  # 是否保存评估结果

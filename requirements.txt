@@ -1,0 +1,26 @@
+# Core dependencies for the project.
+# Pip will install the latest available versions from PyPI.
+# Note: Ensure compatibility between these versions, especially for PyTorch/CUDA.
+# You might need to manually specify versions if conflicts arise.
+
+numpy
+hydra-core
+omegaconf
+joblib
+torch
+scikit-learn
+pandas
+matplotlib
+xarray
+netCDF4
+h5py
+einops
+tqdm
+wandb
+optuna
+mlflow
+torch-geometric
+scipy
+seaborn
+cartopy
+pydmd

@@ -1,0 +1,37 @@
+# conf/paths/default.yaml
+
+# --- Base Directories (Relative to Hydra Run Directory) ---
+hydra_run_dir: ${hydra:runtime.output_dir} # 获取当前运行目录
+
+# 定义输出子目录结构
+models_base_dir: ${paths.hydra_run_dir}/models
+params_base_dir: ${paths.hydra_run_dir}/params
+bmu_base_dir: ${paths.hydra_run_dir}/bmu        # 这是BMU输出目录
+predictions_base_dir: ${paths.hydra_run_dir}/predictions
+reconstructions_base_dir: ${paths.hydra_run_dir}/reconstructions
+evaluation_base_dir: ${paths.hydra_run_dir}/evaluation
+
+# --- Specific Output Directories ---
+som_models_dir: ${paths.models_base_dir}/som
+hmm_params_dir: ${paths.params_base_dir}/hmm
+reconstructed_bmu_dir: ${paths.reconstructions_base_dir}/bmu
+predicted_states_dir: ${paths.predictions_base_dir}/hmm
+lstm_models_dir: ${paths.models_base_dir}/lstm  # <--- 在这里添加定义
+
+# --- Standard File Names (for reference or direct use) ---
+hmm_params_standard_file: ${paths.hmm_params_dir}/hmm_params.pkl
+predicted_states_standard_file: ${paths.predicted_states_dir}/predicted_salinity_states.npy
+
+# --- Input Data Paths (Fixed) ---
+project_root_dir: ${oc.env:PROJECT_ROOT,${hydra:runtime.cwd}}
+raw_data_dir: ${paths.project_root_dir}/data/raw/mini
+processed_data_dir: ${paths.project_root_dir}/data/processed/mini
+
+# --- 添加以下定义 ---
+# 定义 BMU 和 DV 输入数据的目录 (相对于 processed_data_dir)
+bmu_indices_dir: ${paths.processed_data_dir}/BMU
+distance_vectors_dir: ${paths.processed_data_dir}/distance_vectors
+# --- 结束添加 ---
+
+# Directory for predicted low-dimensional sequences (e.g., LSTM output)
+predicted_low_dim_dir: ${hydra:run.dir}/predicted_low_dim
