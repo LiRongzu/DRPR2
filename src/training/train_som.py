@@ -209,26 +209,13 @@ def train_single_feature_som(
     }
     return results
 
-def train_combined_feature_som(cfg: DictConfig, output_feature_name: str = "wind_flow") -> Dict[str, Any]:
-    """
-    加载 wind 和 flow 数据，合并后训练 SOM，生成 BMU。
-
-    Args:
-        cfg: Hydra 配置对象
-        output_feature_name: 输出 BMU 文件中使用的特征名称 (例如 "wind_flow")
-
-    Returns:
-        包含模型路径和 BMU 路径的字典
-    """
-    start_run_time = time.time()
-    config = DrprConfig.from_hydra_config(cfg)
-    device = get_device_from_config(cfg)
-    map_size = cfg.training.som.map_size_obs
-
-    logger.info(f"开始为组合特征 '{output_feature_name}' 训练 SOM...")
-
-    # --- 加载预处理后的 wind 和 flow 数据 ---
+def combine_features(
+        cfg: DictConfig,
+        wind_data: np.ndarray,
+        flow_data: np.ndarray,
+        # --- 加载预处理后的 wind 和 flow 数据 ---
     # 处理所有分割
+    ):
     splits = cfg.training.spilt_group
     combined_features_dict = {}
     
@@ -299,6 +286,33 @@ def train_combined_feature_som(cfg: DictConfig, output_feature_name: str = "wind
             logger.error(f"{split} 分割的特征组合失败: {e}")
             import traceback
             logger.error(traceback.format_exc())
+        
+        return combined_features_dict
+
+def train_combined_feature_som(cfg: DictConfig, output_feature_name: str = "wind_flow") -> Dict[str, Any]:
+    """
+    加载 wind 和 flow 数据，合并后训练 SOM，生成 BMU。
+
+    Args:
+        cfg: Hydra 配置对象
+        output_feature_name: 输出 BMU 文件中使用的特征名称 (例如 "wind_flow")
+
+    Returns:
+        包含模型路径和 BMU 路径的字典
+    """
+    start_run_time = time.time()
+    config = DrprConfig.from_hydra_config(cfg)
+    device = get_device_from_config(cfg)
+    map_size = cfg.training.som.map_size_obs
+
+    logger.info(f"开始为组合特征 '{output_feature_name}' 训练 SOM...")
+
+    # --- 加载预处理后的 wind 和 flow 数据 ---
+    # 处理所有分割
+    splits = cfg.training.spilt_group
+    combined_features_dict = {}
+    
+    combined_features_dict = combine_features(cfg, "wind", "flow")
     
     # 确保训练集数据存在
     if 'train' not in combined_features_dict:
