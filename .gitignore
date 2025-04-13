@@ -34,7 +34,8 @@ data/*
 exp/models/*
 exp/params/*
 outputs/*
-
+srcc/*
+srrcc/*
 # Hydra outputs
 outputs/
 multirun/
