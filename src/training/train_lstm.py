@@ -6,144 +6,123 @@ import torch
 import logging
 import time
 import hydra
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, ListConfig
 import pickle
 import shutil
 from typing import Optional, Dict, Any, Tuple, List
 
-# --- 项目设置 ---
-# ... (如果需要) ...
-
 # --- 集中导入 ---
 from src.utils.hydra_config import DrprConfig
-# from src.utils.logger import setup_logger # 假设 Pipeline 设置 logger
 from src.prediction_models.lstm_pytorch import LSTMPredictionModel # 使用修改后的版本
 from src.data_processing.sequence_utils import create_sequences # 假设这个函数OK
-# from src.utils.data_loader import load_processed_data # 可能不再需要
 from src.utils.model_utils import get_device_from_config
+from src.utils.bmu_utils import convert_grid_to_linear
 
 logger = logging.getLogger(__name__)
 
 def train_and_predict_lstm(
     cfg: DictConfig,
-    low_dim_data_paths: Dict[str, Dict[str, str]],
-    # target_field_name: str,              # 目标特征名 (e.g., 'salinity')
-    # input_feature_info: Dict[str, Dict], # 包含节点数: {'salinity': {'num_nodes': 100}, 'wind_flow': {'num_nodes': 64}}
+    low_dim_data_paths: Dict[str, Dict[str, Dict[str, str]]], # 结构 {feature: {split: {'positions': path}}}
     # --- 目录和模式 ---
-    model_save_dir: str,                 # LSTM 模型保存目录
-    prediction_save_dir: str,            # 预测结果保存目录
-    prediction_filename_pattern: str = "predicted_target_lstm_{split}.npy" # 保存预测的目标 BMU 文件名模式
+    model_save_dir: str,
+    prediction_save_dir: str,
+    prediction_filename_pattern: str = "predicted_target_lstm_{split}.npy"
 ) -> Dict[str, Any]:
-    # \"\"\"
-    # 在低维 BMU 索引数据上训练 LSTM 模型并预测目标 BMU 序列。
-    # 支持多特征输入，但只预测目标特征。
-
-    # Args:
-    #     cfg: Hydra 配置对象。
-    #     low_dim_data_paths: 包含各特征 BMU 索引文件路径的字典 {feature: {split: path}}。
-    #     target_field_name: 目标特征的名称。
-    #     input_feature_info: 包含每个输入特征信息的字典，至少需要 {'num_nodes': N}。
-    #                        特征顺序应与加载/堆叠顺序一致 (target 通常放第一个)。
-    #     model_save_dir: 保存训练好的 LSTM 模型的目录。
-    #     prediction_save_dir: 保存预测出的 *目标* BMU 序列的目录。
-    #     prediction_filename_pattern: 预测的文件名模式 (应包含 {split})。
-
-    # Returns:
-    #     包含结果（如模型路径、预测路径）的字典。
-    # \"\"\"
+    # """Docstring"""
     config = DrprConfig.from_hydra_config(cfg)
     results = {}
     start_time = time.time()
-    device = get_device_from_config(cfg) # 获取设备
+    device = get_device_from_config(cfg)
 
     # --- 1. 确定输入特征和顺序 ---
-    # 确保 target 在第一个位置，以便后续处理
-    target_field_name = "salinity"
+    target_field_name = cfg.model.dimensionality_reduction.get("target_feature", "salinity") # 从DR配置获取目标
     actual_features = list(low_dim_data_paths.keys())
     if target_field_name not in actual_features:
-        logger.error(f"Target field '{target_field_name}' not found in the keys of low_dim_data_paths: {actual_features}")
+        logger.error(f"目标特征 '{target_field_name}' 在 low_dim_data_paths 的键中未找到: {actual_features}")
         return {}
+    # 确保目标特征在第一位
     feature_names_ordered = [target_field_name] + [f for f in actual_features if f != target_field_name]
-    # --- MODIFICATION END ---
-    num_input_features = len(feature_names_ordered)
-    target_feature_index = 0 # 目标特征在堆叠后的索引
-    logger.info(f"LSTM 输入特征顺序: {feature_names_ordered} (共 {num_input_features} 个)")
-    logger.info(f"目标特征 '{target_field_name}' 在索引 {target_feature_index}")
+    logger.info(f"初步 LSTM 输入特征顺序: {feature_names_ordered}")
 
-    # --- 动态构建 input_feature_info ---
+    # --- 动态构建 input_feature_info (包含节点数) ---
+    # (这部分代码似乎在上次修改中已经比较健壮了，但要注意观测特征名的处理)
     try:
         input_feature_info = {
             target_field_name: {
                 'num_nodes': cfg.training.som.map_size_sta[0] * cfg.training.som.map_size_sta[1]
             }
         }
-        # --- MODIFICATION START: Use cfg.model instead of cfg.models ---
-        # Add observation features dynamically if enabled
-        if cfg.model.prediction.lstm.get('use_observation_features', False): # Use .get for safety
-            obs_features = cfg.model.prediction.lstm.observation_features
-        # --- MODIFICATION END ---
-            if isinstance(obs_features, list): # Ensure it's a list
+        # --- 处理观测特征 ---
+        if cfg.model.prediction.lstm.get('use_observation_features', False):
+            obs_features_config = cfg.model.prediction.lstm.observation_features
+            if isinstance(obs_features_config, (list, ListConfig)): # 接受 list 或 ListConfig
+                # 假设观测特征共享一个 SOM (组合特征)
                 num_obs_nodes = cfg.training.som.map_size_obs[0] * cfg.training.som.map_size_obs[1]
-                for feature_name in obs_features:
-                    if feature_name != target_field_name: # Avoid overwriting target if listed again
-                        input_feature_info[feature_name] = {'num_nodes': num_obs_nodes}
-            elif obs_features: # Handle if it's unexpectedly a single string? Log warning.
-                 logger.warning(f"Expected 'observation_features' in config to be a list, but got {type(obs_features)}. Processing as single feature: {obs_features}")
-                 num_obs_nodes = cfg.training.som.map_size_obs[0] * cfg.training.som.map_size_obs[1]
-                 if obs_features != target_field_name:
-                     input_feature_info[obs_features] = {'num_nodes': num_obs_nodes}
+                # 使用组合特征名作为键 (需要与 SOM 训练/保存时一致)
+                obs_feature_combined_name = "_".join(sorted(list(obs_features_config)))
+                if obs_feature_combined_name != target_field_name:
+                     if obs_feature_combined_name in low_dim_data_paths: # 检查路径字典中是否存在
+                         input_feature_info[obs_feature_combined_name] = {'num_nodes': num_obs_nodes}
+                     else:
+                          logger.warning(f"配置了使用观测特征，但未在 low_dim_data_paths 中找到组合特征 '{obs_feature_combined_name}' 的路径。")
+                          # 可能需要移除 obs_feature_combined_name 从 feature_names_ordered
+                # 如果需要处理每个观测特征单独的 SOM，逻辑会更复杂
+            elif obs_features_config:
+                logger.warning(f"预期 observation_features 是列表，但得到 {type(obs_features_config)}。按单一特征处理: {obs_features_config}")
 
-        logger.info(f"Constructed input_feature_info: {input_feature_info}")
+
+        logger.info(f"构建的 input_feature_info: {input_feature_info}")
+
+        # --- 重新验证和排序 feature_names_ordered ---
+        current_features_in_info = list(input_feature_info.keys())
+        # 只保留那些信息和路径都存在的特征
+        valid_feature_names = [f for f in feature_names_ordered if f in current_features_in_info and f in low_dim_data_paths]
+        if target_field_name not in valid_feature_names:
+             logger.error(f"目标特征 '{target_field_name}' 的信息或路径缺失，无法继续。")
+             return {}
+        # 确保目标在第一个
+        if valid_feature_names[0] != target_field_name:
+             valid_feature_names.remove(target_field_name)
+             valid_feature_names.insert(0, target_field_name)
+        feature_names_ordered = valid_feature_names # 更新为最终有效的、有序的特征列表
+        num_input_features = len(feature_names_ordered)
+        logger.info(f"最终有效的 LSTM 输入特征顺序: {feature_names_ordered} (共 {num_input_features} 个)")
+
+        if num_input_features == 0:
+            logger.error("没有有效的输入特征可供 LSTM 使用。")
+            return {}
 
     except AttributeError as e:
-        logger.error(f"Error accessing configuration for map sizes (e.g., cfg.training.som...). Check config structure: {e}", exc_info=True)
+        logger.error(f"访问配置错误 (例如 cfg.training.som...). 检查配置结构: {e}", exc_info=True)
         return {}
     except Exception as e:
-        logger.error(f"Error constructing input_feature_info: {e}", exc_info=True)
+        logger.error(f"构建 input_feature_info 时出错: {e}", exc_info=True)
         return {}
 
-
-    # --- 检查 input_feature_info 是否完整 ---
-    # (Ensure feature_names_ordered matches the keys generated above)
-    # Re-check feature_names_ordered based on the actual keys in input_feature_info if necessary,
-    # maintaining target_field_name at index 0.
-    current_features = list(input_feature_info.keys())
-    if target_field_name not in current_features:
-        logger.error(f"Target field '{target_field_name}' not found in constructed input_feature_info keys!")
-        return {}
-    # --- MODIFICATION START: Ensure feature_names_ordered only contains features present in input_feature_info ---
-    # feature_names_ordered = [target_field_name] + [f for f in current_features if f != target_field_name]
-    # Filter feature_names_ordered to only include those actually in input_feature_info
-    feature_names_ordered = [f for f in feature_names_ordered if f in current_features]
-    if not feature_names_ordered or feature_names_ordered[0] != target_field_name: # Double check target is still first
-        logger.warning(f"Reordering features to place target '{target_field_name}' first.")
-        if target_field_name in feature_names_ordered:
-             feature_names_ordered.remove(target_field_name)
-        feature_names_ordered.insert(0, target_field_name)
-    # --- MODIFICATION END ---
-    num_input_features = len(feature_names_ordered) # Update num_input_features
-    logger.info(f"Final LSTM input feature order: {feature_names_ordered}")
-
-
-    if not all(f in input_feature_info and 'num_nodes' in input_feature_info[f] for f in feature_names_ordered):
-        logger.error(f"input_feature_info 缺失某些特征的 'num_nodes' 信息。需要: {feature_names_ordered}")
-        return results
-
-    # --- 2. 加载并合并低维 BMU 索引数据 ---
-    # This part seems to have been corrected previously to handle dictionary paths
-    logger.info("加载并合并 BMU 索引数据...")
+    # --- 2. 加载、转换并合并低维 BMU 数据 ---
+    logger.info("加载、转换并合并 BMU 数据...")
     low_dim_data: Dict[str, np.ndarray] = {} # 存储合并后的数据: {split: (T, num_features)}
-    expected_length = -1
 
     try:
+        # --- 获取必要的地图宽度 ---
+        map_width_target = cfg.training.som.map_size_sta[1]
+        map_size_obs_cfg = cfg.training.som.get("map_size_obs", cfg.training.som.map_size_sta) # 回退到 sta 大小
+        map_width_obs = map_size_obs_cfg[1]
+        feature_to_map_width = {target_field_name: map_width_target}
+        for f in feature_names_ordered:
+            if f != target_field_name:
+                # 假设所有非目标特征都是观测特征，使用 map_width_obs
+                feature_to_map_width[f] = map_width_obs
+        logger.info(f"将使用的特征到地图宽度映射: {feature_to_map_width}")
+
+        # --- 循环处理 train, val, test ---
         for split in ["train", "val", "test"]:
-            split_data_list = []
+            split_data_list = [] # 存储当前 split 的所有特征的 1D (T,) 数组
             has_split_data = False
-            # --- MODIFICATION START: Iterate over the FINAL feature_names_ordered ---
-            for i, feature in enumerate(feature_names_ordered): # Use the final ordered list
-            # --- MODIFICATION END ---
-                # path = low_dim_data_paths.get(feature, {}).get(split) # Original logic assumed paths were strings
-                # --- Corrected logic from previous step (assuming it's correct) ---
+            current_split_length = -1 # 当前 split 的预期时间长度 T
+
+            # --- 循环处理每个需要的特征 ---
+            for feature in feature_names_ordered:
                 path_info = low_dim_data_paths.get(feature, {}).get(split)
                 path_to_load = None
                 if isinstance(path_info, dict):
@@ -151,83 +130,106 @@ def train_and_predict_lstm(
                     if bmu_positions_path and os.path.exists(bmu_positions_path):
                         path_to_load = bmu_positions_path
                     else:
-                        logger.warning(f"  未找到或无效的 'positions' 路径 for 特征 '{feature}', 分割 '{split}': {path_info}")
-                elif isinstance(path_info, str) and os.path.exists(path_info):
-                     logger.warning(f"    特征 '{feature}' 的 BMU 路径直接是字符串: {path_info}. 假设这是 BMU 索引文件。")
-                     path_to_load = path_info
-                # --- End Corrected logic ---
+                        logger.warning(f"  特征 '{feature}', 分割 '{split}': 未找到或无效的 'positions' 路径: {path_info}")
+                # 可以选择性地添加对 path_info 是字符串的处理
 
                 if path_to_load:
                     try:
-                        data = np.load(path_to_load).flatten() # 确保是一维
-                        has_split_data = True # 只要有一个特征有数据，就处理这个 split
-                        logger.debug(f"  加载 {split} - 特征 '{feature}' from: {path_to_load}, 形状: {data.shape}")
+                        # 1. 加载数据
+                        loaded_data = np.load(path_to_load)
+                        logger.debug(f"  加载 {split} - 特征 '{feature}' from: {path_to_load}, 原始形状: {loaded_data.shape}")
 
-                        # 长度检查
-                        if not split_data_list: # 第一个成功加载的特征决定长度
-                             expected_length = len(data)
-                        elif len(data) != expected_length:
-                             raise ValueError(f"序列长度不一致! {split} - 特征 '{feature}' ({len(data)}) != 预期 ({expected_length})")
+                        # 2. 转换数据为 1D 线性索引 (如果需要)
+                        data_1d = None
+                        if loaded_data.ndim == 2 and loaded_data.shape[1] == 2:
+                            map_width = feature_to_map_width.get(feature)
+                            if map_width is None:
+                                raise ValueError(f"无法找到特征 '{feature}' 的地图宽度进行转换。")
+                            data_1d = convert_grid_to_linear(loaded_data, map_width) # Shape (T,)
+                            logger.debug(f"  转换后 1D 索引形状: {data_1d.shape}")
+                        elif loaded_data.ndim == 1:
+                            logger.debug(f"  特征 '{feature}' 文件已是 1D，假设为有效索引。")
+                            data_1d = loaded_data # Shape (T,)
+                        else:
+                            raise ValueError(f"BMU 文件 {path_to_load} 的形状 {loaded_data.shape} 不可识别。需要 (T, 2) 或 (T,).")
 
-                        split_data_list.append(data)
+                        has_split_data = True # 标记此 split 有数据
+
+                        # 3. 长度检查
+                        if current_split_length == -1: # 这是此 split 的第一个特征
+                            current_split_length = len(data_1d)
+                            logger.debug(f"  设置 {split} 分割的预期长度为: {current_split_length}")
+                        elif len(data_1d) != current_split_length:
+                            raise ValueError(f"序列长度不一致! {split} - 特征 '{feature}' ({len(data_1d)}) != 预期 ({current_split_length})")
+
+                        # 4. 添加到列表
+                        split_data_list.append(data_1d) # 添加 (T,) 数组
+
+                    # --- Error Handling ---
                     except FileNotFoundError:
-                         logger.error(f"  文件未找到: {path_to_load}")
-                         # Decide how to handle - break split?
-                         has_split_data = False
-                         break
+                        logger.error(f"  文件未找到: {path_to_load}")
+                        has_split_data = False; break # 停止处理此 split
+                    except ValueError as ve:
+                        logger.error(f"  处理 BMU 文件 {path_to_load} 时出错: {ve}")
+                        has_split_data = False; break # 停止处理此 split
                     except Exception as load_err:
-                         logger.error(f"  加载 BMU 文件 {path_to_load} 失败: {load_err}")
-                         has_split_data = False
-                         break
+                        logger.error(f"  加载或转换 BMU 文件 {path_to_load} 失败: {load_err}", exc_info=True)
+                        has_split_data = False; break # 停止处理此 split
                 else:
-                    # If a required feature's path is missing for this split
-                    logger.error(f"  未找到 {split} 数据 for 必需特征 '{feature}'。无法继续处理此分割。")
+                    # 如果某个必需特征的路径找不到
+                    logger.error(f"  未找到 {split} 数据 for 必需特征 '{feature}'。无法继续处理此分割。")
                     has_split_data = False
-                    break # Stop processing this split
+                    break # 停止处理此 split
 
+            # --- 合并当前 split 的数据 ---
             if has_split_data and len(split_data_list) == num_input_features:
-                 # 堆叠特征 -> (T, num_features)
-                 combined_split_data = np.stack(split_data_list, axis=-1)
-                 logger.info(f"  合并后 {split} 数据形状: {combined_split_data.shape}")
-                 low_dim_data[split] = combined_split_data
-                 expected_length = -1 # 重置
-            elif has_split_data: # 意味着有些特征缺失，无法堆叠
-                 logger.error(f"未能加载 {split} 的所有必需特征数据 ({len(split_data_list)}/{num_input_features})，跳过此分割。")
+                # *** 核心合并步骤 ***
+                # split_data_list 是 [(T,), (T,), ...] 列表
+                # 使用 np.stack(..., axis=-1) 或 np.column_stack(...)
+                try:
+                    combined_split_data = np.stack(split_data_list, axis=-1)
+                    # 或者: combined_split_data = np.column_stack(split_data_list)
 
+                    # --- >>> 验证形状 <<< ---
+                    if combined_split_data.shape != (current_split_length, num_input_features):
+                         logger.error(f"合并 {split} 数据后的形状不正确: {combined_split_data.shape}，预期: ({current_split_length}, {num_input_features})")
+                         #可以选择继续处理下一个 split 或直接返回错误
+                         continue # 跳过这个错误的 split
+                    logger.info(f"  合并后 {split} 数据形状: {combined_split_data.shape}") #<--- 检查这个日志输出!
+                    low_dim_data[split] = combined_split_data
+                except Exception as stack_err:
+                    logger.error(f"堆叠 {split} 分割的特征数据时出错: {stack_err}", exc_info=True)
+                    # 跳过这个 split
 
-    except ValueError as e: # Catch length mismatch error
-        logger.error(f"加载或合并 LSTM 输入数据时出错: {e}", exc_info=True)
-        return results
+            elif has_split_data: # 加载了部分但非全部特征
+                logger.error(f"未能加载 {split} 的所有必需特征数据 ({len(split_data_list)}/{num_input_features})，跳过此分割。")
+
+            # 重置长度以便下一个 split 重新确定
+            current_split_length = -1
+
+    except AttributeError as e:
+         logger.error(f"访问配置错误 (可能在获取地图宽度时): {e}", exc_info=True)
+         return {}
     except Exception as e:
-        logger.error(f"加载或合并 LSTM 输入数据时发生意外错误: {e}", exc_info=True)
-        return results
+        logger.error(f"加载、转换或合并 LSTM 输入数据时发生意外错误: {e}", exc_info=True)
+        return {}
 
-    if 'train' not in low_dim_data:
-        logger.error("缺少合并后的训练数据，无法训练 LSTM。")
-        return results
-
+    # --- 检查是否有训练数据 ---
+    if 'train' not in low_dim_data or low_dim_data['train'].size == 0:
+        logger.error("缺少合并后的训练数据或训练数据为空，无法训练 LSTM。")
+        return results # results['success'] 默认为 False
 
     # --- 3. 准备 LSTM 序列 ---
-    # --- MODIFICATION START: Use cfg.model ---
     lstm_cfg = config.model.prediction.lstm
-    # --- MODIFICATION END ---
     seq_len = lstm_cfg.get("sequence_length", 10)
     logger.info(f"为 LSTM 创建序列，输入序列长度: {seq_len}...")
 
-    # 确定目标特征在堆叠数据中的索引 (我们约定是 0)
+    # 确定目标特征在堆叠数据中的索引 (按约定是 0)
     target_feature_index = 0
-    # --- MODIFICATION START: Check against the FINAL feature_names_ordered ---
     if feature_names_ordered[target_feature_index] != target_field_name:
+        # 这个错误理论上不应发生，因为前面排序了
         logger.error(f"逻辑错误：目标特征 '{target_field_name}' 未按预期放在第 {target_feature_index} 列！顺序: {feature_names_ordered}")
-        # Attempt to find it
-        try:
-            target_feature_index = feature_names_ordered.index(target_field_name)
-            logger.warning(f"目标特征在索引 {target_feature_index} 找到。")
-        except ValueError:
-             logger.error("逻辑错误：目标特征未在最终输入特征列表中找到！")
-             return {}
-    # --- MODIFICATION END ---
-
+        return {}
 
     X_seq: Dict[str, np.ndarray] = {}
     y_seq: Dict[str, np.ndarray] = {} # 目标是 Target BMU index (int)
@@ -236,51 +238,52 @@ def train_and_predict_lstm(
         # stacked_data shape: (T, num_input_features)
         logger.debug(f"为 split '{split}' 创建序列，输入数据形状: {stacked_data.shape}")
 
-        if len(stacked_data) > seq_len:
+        if len(stacked_data) >= seq_len + 1: # 确保至少有 seq_len+1 个点来创建一个序列
             # target_data shape: (T,)
-            target_data = stacked_data[:, target_feature_index]
+            target_data = stacked_data[:, target_feature_index].astype(int) # 确保目标是整数索引
 
             X_seq_split, y_seq_split = create_sequences(
-                X=stacked_data,         # (T, num_features)
-                y=target_data,          # (T,)
+                X=stacked_data,          # (T, num_features)
+                y=target_data,           # (T,)
                 sequence_length=seq_len
             )
 
-            # 检查返回的形状是否符合预期
-            if X_seq_split.ndim != 3 or X_seq_split.shape[1] != seq_len or X_seq_split.shape[2] != num_input_features:
-                logger.error(f"'{split}' 的 X_seq 形状不正确: {X_seq_split.shape} (预期: (N, {seq_len}, {num_input_features}))")
-                # 可以选择跳过这个 split 或中止
-                continue
+            # 验证 create_sequences 的输出形状
+            expected_x_shape_suffix = (seq_len, num_input_features)
+            if X_seq_split.ndim != 3 or X_seq_split.shape[1:] != expected_x_shape_suffix:
+                logger.error(f"'{split}' 的 X_seq 形状不正确: {X_seq_split.shape} (预期后缀: {expected_x_shape_suffix})")
+                continue # 跳过这个 split
             if y_seq_split.ndim != 1:
                 logger.error(f"'{split}' 的 y_seq 形状不正确: {y_seq_split.shape} (预期: (N,))")
                 continue
 
             X_seq[split] = X_seq_split
             y_seq[split] = y_seq_split
-
-            logger.info(f"  {split} 序列创建完成: X={X_seq[split].shape}, y={y_seq[split].shape}")
+            logger.info(f"  {split} 序列创建完成: X={X_seq[split].shape}, y={y_seq[split].shape}") #<--- 检查 X 的最后一个维度是否为 num_input_features
         else:
-            logger.warning(f"  {split} 数据长度不足 ({len(stacked_data)})，无法创建长度为 {seq_len} 的序列。")
+            logger.warning(f"  {split} 数据长度不足 ({len(stacked_data)})，无法创建长度为 {seq_len} 的序列。")
 
-    # --- 后续检查 'train' 是否成功创建序列 ---
+    # ... (后续检查 'train' 是否有序列) ...
     if 'train' not in X_seq or X_seq['train'].size == 0:
-        logger.error("未能成功创建训练序列。检查数据长度和序列长度设置。")
-        return {} # 返回空字典表示失败
+         logger.error("未能成功创建训练序列。检查数据长度和序列长度设置。")
+         return {} # 返回空字典表示失败
 
-    # --- 4. 移除 Scaling ---
+    # --- 4. 跳过标准化 ---
     logger.info("BMU 索引数据，跳过标准化缩放。")
 
     # --- 5. 初始化和训练 LSTM 模型 ---
-    logger.info("初始化并训练 LSTM 模型 (用于 BMU 索引预测)...")
-
-    # --- 准备模型参数 ---
+    # ... (准备模型参数，调用 lstm_model.fit) ...
+    # 确保 LSTMPredictionModel 初始化时 num_embeddings_list 和 embedding_dims_list 的长度
+    # 与 num_input_features 匹配。
     num_embeddings_list = [input_feature_info[f]['num_nodes'] for f in feature_names_ordered]
-    # 假设所有 embedding 维度相同，从配置读取
-    # --- MODIFICATION START: Use cfg.model ---
-    default_emb_dim = lstm_cfg.get("embedding_dim", 32) # Example default
-    # --- MODIFICATION END ---
+    default_emb_dim = lstm_cfg.get("embedding_dim", 32)
     embedding_dims_list = [default_emb_dim] * num_input_features
     target_som_num_nodes = input_feature_info[target_field_name]['num_nodes']
+
+    # 检查列表长度是否匹配
+    if len(num_embeddings_list) != num_input_features or len(embedding_dims_list) != num_input_features:
+        logger.error(f"嵌入参数列表长度 ({len(num_embeddings_list)}, {len(embedding_dims_list)}) 与输入特征数 ({num_input_features}) 不匹配！")
+        return {}
 
     lstm_model = LSTMPredictionModel(
         # --- 架构 ---
@@ -292,11 +295,11 @@ def train_and_predict_lstm(
         num_layers=lstm_cfg.get("num_layers", 2),
         dropout=lstm_cfg.get("dropout", 0.1),
         # --- 训练 ---
-        epochs=cfg.training.get("epochs", 100),
+        epochs=lstm_cfg.get("epochs", 100),
         batch_size=lstm_cfg.get("batch_size", 32),
         # --- MODIFICATION END ---
-        learning_rate=cfg.training.optimizer.get("learning_rate", 0.001),
-        patience=cfg.training.early_stopping.get("patience", 10),
+        learning_rate=lstm_cfg.get("lr", 0.001),
+        patience=lstm_cfg.get("patience", 10),
         # --- 其他 ---
         sequence_length=seq_len, # 参考用
         random_seed=cfg.training.random_seed,
@@ -326,30 +329,29 @@ def train_and_predict_lstm(
         # return results # 或者在这里返回
 
     # --- 7. 使用 LSTM 模型预测 ---
+    # 确保 predict 方法能处理形状为 (N, seq_len, num_input_features) 的输入
     logger.info("使用训练好的 LSTM 预测 *目标* BMU 索引序列...")
-    # 注意：key 改为 'predicted_target_low_dim_paths'
     results['predicted_target_low_dim_paths'] = {}
     os.makedirs(prediction_save_dir, exist_ok=True)
 
     for split in ["train", "val", "test"]:
         if split not in X_seq:
-             logger.warning(f"跳过 {split} 分割的 LSTM 预测，因为没有输入序列。")
-             continue
+            logger.warning(f"跳过 {split} 分割的 LSTM 预测，因为没有输入序列。")
+            continue
 
-        logger.info(f"  预测 {split} 分割...")
+        logger.info(f"  预测 {split} 分割...")
         try:
-            # 使用模型的 predict 方法
-            predicted_target_indices = lstm_model.predict(X_seq[split]) # (num_samples,)
-            logger.info(f"  预测的 {split} 目标 BMU 索引形状: {predicted_target_indices.shape}")
+            predicted_target_indices = lstm_model.predict(X_seq[split]) # 输入 (N, seq_len, num_features)
+            logger.info(f"  预测的 {split} 目标 BMU 索引形状: {predicted_target_indices.shape}") # 输出 (N,)
 
-            # 保存预测的目标索引结果
+            # ... (保存预测结果) ...
             pred_save_path = os.path.join(prediction_save_dir, prediction_filename_pattern.format(split=split))
             np.save(pred_save_path, predicted_target_indices)
-            logger.info(f"  预测的 {split} *目标* BMU 索引序列已保存到: {pred_save_path}")
+            logger.info(f"  预测的 {split} *目标* BMU 索引序列已保存到: {pred_save_path}")
             results['predicted_target_low_dim_paths'][split] = pred_save_path
 
         except Exception as e:
-            logger.error(f"  预测 {split} 目标 BMU 索引序列失败: {e}", exc_info=True)
+            logger.error(f"  预测 {split} 目标 BMU 索引序列失败: {e}", exc_info=True)
 
 
     total_run_time = time.time() - start_time

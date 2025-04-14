@@ -67,22 +67,8 @@ def run_dimensionality_reduction(cfg: DictConfig, feature_name: str, is_observat
         map_size_to_use = cfg.training.som.map_size_sta
         logger.info(f"使用目标特征的 SOM map_size: {map_size_to_use}")
 
-    # Temporarily set the map_size in the config for the training function
-    # Ensure the config is mutable if needed (may not be necessary if train_som reads it directly)
-    # OmegaConf.set_struct(cfg.training.som, False) # Allow modification
-    # cfg.training.som.map_size = map_size_to_use
-    # OmegaConf.set_struct(cfg.training.som, True) # Make immutable again
-    # --- MODIFICATION END ---
-
     som_results = {}
-    # --- MODIFICATION START: Pass map_size explicitly or ensure train_som reads correctly --- 
-    # Option 1: Modify train_som to accept map_size (preferred)
-    # Option 2: Modify cfg temporarily (shown above, but less clean)
-    # Assuming train_som is modified or reads the correct sub-config based on feature type
-    # We will rely on train_som to use the correct map_size based on its logic or passed args
-    # The logging above confirms which size *should* be used.
 
-    # Determine if it's a combined feature based on observation features list
     is_combined_feature = False
     obs_features_list = list(cfg.model.prediction.lstm.get('observation_features', []))
     if feature_name != config.reconstruction.target_field and '_' in feature_name:
@@ -107,12 +93,6 @@ def run_dimensionality_reduction(cfg: DictConfig, feature_name: str, is_observat
             # map_size=map_size_to_use # Example if function signature allows
             # Ensure train_single_feature_som uses the correct map_size (sta or obs)
         )
-    # --- MODIFICATION END ---
-
-    # Restore original map_size if cfg was modified (if Option 2 was used)
-    # OmegaConf.set_struct(cfg.training.som, False)
-    # cfg.training.som.map_size = original_map_size
-    # OmegaConf.set_struct(cfg.training.som, True)
 
     # --- 检查结果 ---
     if not som_results:

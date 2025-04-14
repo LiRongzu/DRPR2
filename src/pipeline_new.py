@@ -67,9 +67,10 @@ def run_dimensionality_reduction(cfg: DictConfig) -> Dict[str, Any]:
     config = DrprConfig.from_hydra_config(cfg)
     method = cfg.model.dimensionality_reduction.method
     logger.info(f"--- 阶段：维度降低 (方法: {method}) ---")
-    results = {'method': method, 'success': False} # Initialize success to False
-    dr_results = None # For PCA/AE results
-    primary_bmu_paths = {} # Store the main BMU paths needed for prediction
+    results = {'method': method, 'success': False} # 初始化 success 为 False
+    # 这个字典将存储最终传递给预测阶段的低维数据路径
+    # 结构: {feature_name: {split: {'positions': path}}}
+    low_dim_data_paths_for_pred = {}
 
     # --- 定义降维所需的路径 (通用) ---
     target_field_dr = cfg.model.dimensionality_reduction.get("target_feature", "salinity") # Target for state DR
@@ -92,161 +93,217 @@ def run_dimensionality_reduction(cfg: DictConfig) -> Dict[str, Any]:
     if method == 'som':
         som_state_results = None
         som_obs_results = None
-        state_bmu_positions = {}
-        obs_bmu_positions = {}
+        state_bmu_positions = {} # 临时存储 {split: path}
+        obs_bmu_positions = {}   # 临时存储 {split: path}
 
-        # --- Train State SOM (e.g., salinity) ---
-        # Always run state SOM for now, needed for reconstruction
+        # --- 步骤 1: 训练状态 SOM (总是需要) ---
         logger.info(f"训练状态 SOM ({target_field_dr})...")
         som_state_results = train_single_feature_som(cfg, feature_name=target_field_dr)
-        logger.info(f"状态 SOM 返回结果: {som_state_results}") # Log the result
+        logger.info(f"状态 SOM 返回结果: {som_state_results}") # 打印详细结果
 
         if som_state_results and isinstance(som_state_results, dict):
-            results['som_state'] = som_state_results
+            results['som_state'] = som_state_results # 存储完整的状态 SOM 结果
+            results['model_path'] = som_state_results.get('model_path') # 状态 SOM 模型用于重建
+            results['target_feature'] = target_field_dr # 记录降维的目标特征名
             bmu_paths_state = som_state_results.get('bmu_indices_paths', {})
+
             if bmu_paths_state:
-                 try:
-                     # Ensure inner dict and 'positions' key exist
-                     state_bmu_positions = {split: p['positions'] for split, p in bmu_paths_state.items() if isinstance(p, dict) and 'positions' in p and p['positions']}
-                     logger.info(f"提取的状态 BMU 位置路径: {state_bmu_positions}")
-                 except Exception as e:
-                     logger.error(f"从状态 SOM 结果提取 BMU 位置路径时出错: {e}", exc_info=True)
+                try:
+                    # 提取 {split: path} 格式的状态 BMU 位置路径
+                    state_bmu_positions = {split: p['positions'] for split, p in bmu_paths_state.items() if isinstance(p, dict) and 'positions' in p and p['positions']}
+                    logger.info(f"提取的状态 BMU 位置路径: {state_bmu_positions}")
+                    if not state_bmu_positions: # 如果提取结果为空字典
+                         raise ValueError("未能从状态 SOM 结果中提取有效的 BMU 位置路径。")
+                    # 将状态 BMU 路径按所需格式添加到 low_dim_data_paths_for_pred
+                    low_dim_data_paths_for_pred[target_field_dr] = {
+                        split: {'positions': path} for split, path in state_bmu_positions.items()
+                    }
+                except Exception as e:
+                    logger.error(f"从状态 SOM 结果提取或格式化 BMU 位置路径时出错: {e}", exc_info=True)
+                    # results['success'] 已经是 False，直接返回
+                    return results
             else:
-                 logger.warning("状态 SOM 结果中未找到 'bmu_indices_paths' 或其为空。")
-            results['low_dim_dv_paths'] = som_state_results.get('dv_paths', {})
-            results['model_path'] = som_state_results.get('model_path') # State SOM model path for reconstruction
+                logger.error("状态 SOM 结果中未找到 'bmu_indices_paths' 或其为空。")
+                # results['success'] 已经是 False，直接返回
+                return results
         else:
             logger.error("状态 SOM 训练失败或未返回有效字典。")
-            # State SOM failure is likely fatal for reconstruction
-            results['success'] = False
-            logger.info(f"--- 降维完成 (方法: {method}) ---")
+            # results['success'] 已经是 False，直接返回
             return results
 
+        # --- 步骤 2: 检查是否需要观测 SOM ---
+        needs_obs_som = False
+        observation_features = []
+        pred_method = cfg.model.prediction.method
+        obs_feature_name = None # 初始化
 
-        # --- Train Observation SOM (if prediction is HMM) ---
-        if cfg.model.prediction.method == 'hmm':
-            observation_features = list(cfg.model.prediction.hmm.observation_features)
+        if pred_method == 'hmm':
+            needs_obs_som = True
+            observation_features = list(cfg.model.prediction.hmm.get('observation_features', []))
             if not observation_features:
                  logger.error("HMM 预测方法已选择，但未在配置中指定 observation_features。")
-                 raise ValueError("HMM 需要 observation_features 配置。")
+                 return results # 配置错误
+            obs_feature_name = "_".join(sorted(observation_features))
 
-            obs_feature_name = "_".join(sorted(observation_features)) # e.g., "flow_wind"
-            logger.info(f"训练观测 SOM ({obs_feature_name}) for HMM...")
+        elif pred_method == 'lstm' and cfg.model.prediction.lstm.get('use_observation_features', False):
+             needs_obs_som = True
+             observation_features = list(cfg.model.prediction.lstm.get('observation_features', []))
+             if not observation_features:
+                  logger.error("LSTM 配置了 use_observation_features=True 但未提供 observation_features。")
+                  return results # 配置错误
+             obs_feature_name = "_".join(sorted(observation_features))
+        # 添加 elif 用于其他需要观测 SOM 的预测器
 
-            # Temporarily set map size for observation SOM from config if different
+        # --- 步骤 3: 如果需要，训练观测 SOM ---
+        if needs_obs_som:
+            logger.info(f"训练观测 SOM ({obs_feature_name}) for {pred_method}...")
+
+            # --- (临时设置观测 SOM 的 map_size，如果配置不同) ---
             original_map_size = cfg.training.som.map_size
-            map_size_obs = cfg.training.som.get("map_size_obs", original_map_size) # Get obs size or default
+            map_size_obs = cfg.training.som.get("map_size_obs", original_map_size)
             if map_size_obs != original_map_size:
-                 logger.info(f"临时为观测 SOM 设置地图大小: {map_size_obs}")
-                 cfg.training.som.map_size = map_size_obs # Use obs map size
+                logger.info(f"临时为观测 SOM 设置地图大小: {map_size_obs}")
+                try:
+                    # 使用 OmegaConf.set_struct 防止意外添加新键，如果需要灵活性则设为 False
+                    # OmegaConf.set_struct(cfg.training.som, False)
+                    cfg.training.som.map_size = map_size_obs # 假设 map_size 是 list 或 ListConfig
+                    # 如果是 list，需要转换: cfg.training.som.map_size = list(map_size_obs)
+                except Exception as e:
+                     logger.error(f"修改观测 SOM 地图大小时出错: {e}")
+                     # 可能需要更健壮的配置修改方式，例如创建副本或使用 with 语句
 
+            # --- 调用 SOM 训练 ---
             if len(observation_features) == 1:
                 som_obs_results = train_single_feature_som(cfg, feature_name=observation_features[0])
-            else: # Combined features
+            else: # 组合特征
                 som_obs_results = train_combined_feature_som(cfg, output_feature_name=obs_feature_name)
 
-            # Restore original map size in config if it was changed
+            # --- (恢复原始 map_size) ---
             if map_size_obs != original_map_size:
                  cfg.training.som.map_size = original_map_size
                  logger.info(f"恢复 SOM 地图大小为: {original_map_size}")
 
-            logger.info(f"观测 SOM 返回结果: {som_obs_results}") # Log the result
+            logger.info(f"观测 SOM 返回结果: {som_obs_results}") # 打印详细结果
 
+            # --- 处理观测 SOM 结果 ---
             if som_obs_results and isinstance(som_obs_results, dict):
-                results['som_observation'] = som_obs_results
+                results['som_observation'] = som_obs_results # 存储完整结果
+                results['som_observation_model_path'] = som_obs_results.get('model_path') # 存储模型路径
                 bmu_paths_obs = som_obs_results.get('bmu_indices_paths', {})
                 if bmu_paths_obs:
                     try:
-                        # Ensure inner dict and 'positions' key exist
+                        # 提取 {split: path} 格式
                         obs_bmu_positions = {split: p['positions'] for split, p in bmu_paths_obs.items() if isinstance(p, dict) and 'positions' in p and p['positions']}
                         logger.info(f"提取的观测 BMU 位置路径: {obs_bmu_positions}")
+                        if not obs_bmu_positions:
+                             raise ValueError("未能从观测 SOM 结果中提取有效的 BMU 位置路径。")
+                        # 将观测 BMU 路径按所需格式添加到 low_dim_data_paths_for_pred
+                        low_dim_data_paths_for_pred[obs_feature_name] = {
+                            split: {'positions': path} for split, path in obs_bmu_positions.items()
+                        }
                     except Exception as e:
-                        logger.error(f"从观测 SOM 结果提取 BMU 位置路径时出错: {e}", exc_info=True)
+                        logger.error(f"从观测 SOM 结果提取或格式化 BMU 位置路径时出错: {e}", exc_info=True)
+                        # results['success'] 已经是 False，直接返回
+                        return results
                 else:
-                    logger.warning("观测 SOM 结果中未找到 'bmu_indices_paths' 或其为空。")
-                results['som_observation_model_path'] = som_obs_results.get('model_path') # Store obs SOM model path
+                    logger.error(f"观测 SOM ({obs_feature_name}) 结果中未找到 'bmu_indices_paths' 或其为空 ({pred_method} 需要)。")
+                    # results['success'] 已经是 False，直接返回
+                    return results
             else:
-                # If HMM is the predictor, observation SOM is essential
-                logger.error("观测 SOM 训练失败或未返回有效字典 (HMM 需要)。")
-                results['success'] = False # Mark as failed
-                logger.info(f"--- 降维完成 (方法: {method}) ---") # Log completion before returning
+                logger.error(f"观测 SOM ({obs_feature_name}) 训练失败或未返回有效字典 ({pred_method} 需要)。")
+                # results['success'] 已经是 False，直接返回
                 return results
 
+        # --- 步骤 4: 设置最终的 low_dim_data_paths 和 success 标志 ---
+        if low_dim_data_paths_for_pred:
+            # 检查是否所有需要的特征路径都已生成
+            required_features = [target_field_dr]
+            if needs_obs_som:
+                 required_features.append(obs_feature_name)
 
-        if cfg.model.prediction.method == 'hmm':
-            if obs_bmu_positions:
-                primary_bmu_paths = obs_bmu_positions
-                logger.info("将观测 SOM BMU 位置设置为主要低维数据路径 (for HMM)。")
-                results['success'] = True
+            all_features_present = all(feat in low_dim_data_paths_for_pred for feat in required_features)
+
+            if all_features_present:
+                 results['low_dim_data_paths'] = low_dim_data_paths_for_pred
+                 logger.info(f"最终设置的 low_dim_data_paths (for prediction): {results['low_dim_data_paths']}")
+                 results['success'] = True # <--- 只有在这里才设置成功
             else:
-                logger.error("HMM 模式下未能获取观测 BMU 位置路径。")
-                # Failure should have been caught above, but set success=False just in case
-                results['success'] = False
-        else: # Not HMM (e.g., LSTM using state BMUs)
-            if state_bmu_positions:
-                primary_bmu_paths = state_bmu_positions
-                logger.info("将状态 SOM BMU 位置设置为主要低维数据路径。")
-            else:
-                logger.error("非 HMM 模式下未能获取状态 BMU 位置路径。")
-                # If state SOM failed earlier, success should already be False
-                results['success'] = False
-
-
-        if primary_bmu_paths and results.get('success', True) is not False : # Check if paths exist AND no fatal error occurred
-             results['low_dim_data_paths'] = primary_bmu_paths
-             logger.info(f"最终设置的 low_dim_data_paths: {primary_bmu_paths}")
-             results['success'] = True # Explicitly set success if paths are assigned
-        elif results.get('success', True) is not False: # If no fatal error, but paths are missing
-             logger.error("未能确定主要的低维数据路径 (BMU positions)。")
-             results['success'] = False # Mark failure if paths are missing
+                 missing_features = [f for f in required_features if f not in low_dim_data_paths_for_pred]
+                 logger.error(f"未能为预测阶段生成所有必需的 SOM BMU 路径。缺少: {missing_features}")
+                 # results['success'] 保持 False
+        else:
+            # 如果状态 SOM 成功但观测 SOM 失败（如果需要），则 low_dim_data_paths_for_pred 可能不为空，但上面会提前返回
+            # 这个 else 理论上只会在状态 SOM 提取路径就失败时到达（也已提前返回）
+            # 作为最后的保险：
+            logger.error("未能为预测阶段生成任何 SOM BMU 输出路径。")
+            # results['success'] 保持 False
 
 
     elif method == 'pca':
-        # ... (PCA logic remains the same) ...
-        # Ensure PCA logic sets results['success'] and results['low_dim_data_paths']
-        if 'train' not in high_dim_paths:
-             logger.error("缺少用于 PCA 的高维训练数据路径。")
-             results['success'] = False
-             return results
-        model_path = os.path.join(dr_model_dir, f"pca_model_{target_field_dr}.pkl")
-        dr_scaler_path = os.path.join(config.paths.processed_data_dir, f"pca_{target_field_dr}_input_scaler.pkl")
-        dr_results = train_and_transform_pca(
-            cfg, high_dim_paths, model_path, dr_scaler_path, transformed_data_dir
+        # --- PCA 逻辑 ---
+        # ... (调用 train_and_transform_pca) ...
+        dr_results_pca = train_and_transform_pca(
+             cfg, high_dim_paths, model_path, dr_scaler_path, transformed_data_dir
         )
-        if dr_results:
-            results.update(dr_results)
-            # Check if train_and_transform_pca sets 'low_dim_data_paths' and 'success'
-            if 'low_dim_data_paths' in dr_results and dr_results.get('success', False):
-                results['success'] = True
-            else:
-                results['success'] = False
+        if dr_results_pca and dr_results_pca.get('success') and 'low_dim_data_paths' in dr_results_pca:
+             results.update(dr_results_pca) # 合并 PCA 返回的结果
+             # 确保 PCA 返回的 low_dim_data_paths 格式正确
+             # PCA 通常只处理一个目标特征，格式应为 {target_field_dr: {split: path}}
+             pca_paths = dr_results_pca['low_dim_data_paths']
+             if isinstance(pca_paths, dict) and target_field_dr in pca_paths and isinstance(pca_paths[target_field_dr], dict):
+                 results['low_dim_data_paths'] = pca_paths # 格式似乎兼容
+                 results['success'] = True
+             else:
+                 logger.error(f"PCA 返回的 low_dim_data_paths 格式不正确: {pca_paths}")
+                 results['success'] = False
         else:
-            results['success'] = False
+             logger.error("PCA 降维失败或未返回预期结果。")
+             results['success'] = False
+
+    elif method == 'autoencoder':
+         # --- Autoencoder 逻辑 ---
+         # 类似 PCA，需要 train_and_transform_ae 返回 {'success': True, 'low_dim_data_paths': {target_field_dr: {split: path}}, ...}
+         # ...
+         pass # Placeholder
+         # ...
+         # results['success'] = True # 如果成功
+         # results['low_dim_data_paths'] = ae_results['low_dim_data_paths']
+
     else:
         logger.error(f"未知的降维方法: {method}")
-        results['success'] = False
-
+        # results['success'] is already False
 
     # --- Final Check and Logging ---
-    if results.get('success', False):
-         if 'low_dim_data_paths' in results and results['low_dim_data_paths']:
-              logger.info(f"成功生成低维数据路径: {results['low_dim_data_paths']}")
-         else:
-              logger.error("降维标记为成功，但 low_dim_data_paths 为空或缺失！")
-              results['success'] = False # Correct the status
-    else:
-         logger.error("降维步骤未能生成低维数据路径或遇到致命错误。")
+    # 这个最终检查现在更可靠，因为它只在前面明确设置 success=True 后才检查路径
+    if not results.get('success'): # 检查是否为 False
+         logger.error("降维步骤未能成功完成。") # 统一错误消息
+    elif 'low_dim_data_paths' not in results or not results['low_dim_data_paths'] or not isinstance(results['low_dim_data_paths'], dict):
+         # 这个检查只在 success=True 时运行
+         logger.error("降维步骤标记为成功，但 low_dim_data_paths 丢失、为空或格式不正确！")
+         results['success'] = False # 修正状态为 False
+    # else: # 如果成功且路径有效，不需要额外日志，前面已经打过了
+    #      logger.info(f"降维步骤成功，生成的低维数据路径: {results['low_dim_data_paths']}")
 
 
-    logger.info(f"--- 降维完成 (方法: {method}) ---")
+    logger.info(f"--- 降维完成 (方法: {method}, 成功: {results.get('success')}) ---") # Log final status
     return results
 
 def run_prediction(cfg: DictConfig, dr_results: Dict[str, Any]) -> Dict[str, Any]:
     """运行所选的预测方法。"""
     config = DrprConfig.from_hydra_config(cfg)
     method = cfg.model.prediction.method
+        # --- >>> 添加这部分代码 <<< ---
+    # 在函数开始处，从 dr_results 获取降维方法
+    dr_method = dr_results.get('method')
+    if not dr_method:
+        # 如果 dr_results 字典中没有 'method' 键，这是个问题
+        logger.error("无法从 dr_results 中获取降维方法 ('method' key missing)。预测阶段无法继续。")
+        # 返回一个表示失败的字典
+        return {'method': method, 'success': False}
+    # --- >>> 添加结束 <<< ---
     logger.info(f"--- 阶段：预测 (方法: {method}) ---")
     results = {'method': method}
+    results['success'] = False # Initialize success to False
     pred_results = None
 
     low_dim_data_paths = dr_results.get('low_dim_data_paths')
@@ -262,8 +319,6 @@ def run_prediction(cfg: DictConfig, dr_results: Dict[str, Any]) -> Dict[str, Any
     os.makedirs(pred_output_dir, exist_ok=True)
 
     if method == 'hmm':
-        # 如果 DR 是 SOM，HMM 需要状态和观测 SOM 模型
-        # 如果 DR 是 PCA/AE，则需要修改 HMM
         dr_method = dr_results['method']
         hmm_input_type = cfg.model.prediction.hmm.get('input_type', 'bmu_rank')
 
@@ -293,155 +348,187 @@ def run_prediction(cfg: DictConfig, dr_results: Dict[str, Any]) -> Dict[str, Any
             if pred_results and 'predicted_states_paths' in pred_results:
                  results['predicted_low_dim_paths'] = pred_results['predicted_states_paths'] # 存储状态路径用于重建
                  results['model_path'] = pred_results.get('standard_model_path') or pred_results.get('model_path')
-
-        elif dr_method in ['pca', 'autoencoder']:
-            # HMM 处理连续输入的挑战点
-            if hmm_input_type == 'continuous':
-                logger.error(f"使用 GaussianHMM 处理来自 {dr_method} 的连续低维输入的 HMM 逻辑尚未实现。需要修改 train_hmm.py。")
-                results['success'] = False; return results
-                # 如果已实现：
-                # 1. 修改 train_hmm.py 以使用 GaussianHMM 并在 continuous low_dim_data_paths 上拟合
-                # 2. 调用修改后的 HMM 训练函数
-                # 3. HMM 将预测低维向量序列 (隐藏状态的均值)
-
-            elif hmm_input_type == 'discrete':
-                 logger.error(f"将来自 {dr_method} 的连续低维输入离散化以用于 CategoricalHMM 的逻辑尚未实现。需要在 Pipeline 中添加 K-Means 或类似步骤。")
-                 results['success'] = False; return results
-                 # 如果已实现：
-                 # 1. 在此步骤之前添加一个离散化步骤（例如 K-Means）
-                 # 2. 将离散化后的状态序列传递给现有的 train_hmm_main
-            else:
-                 logger.error(f"未知的 HMM 输入类型配置: {hmm_input_type}")
-                 results['success'] = False; return results
+                 results['success'] = True # 标记成功
+                 
 
         else:
              logger.error(f"不支持的降维方法 ({dr_method}) 与 HMM 组合。")
              results['success'] = False; return results
 
     elif method == 'lstm':
-        dr_method = dr_results['method']
-        lstm_input_type = cfg.model.prediction.lstm.get('input_type')
-        model_save_dir_lstm = os.path.join(pred_model_dir) # 在此保存 LSTM 模型
-        scaler_save_path_lstm = os.path.join(config.paths.processed_data_dir, f"{dr_results['method']}_lstm_input_scaler.pkl")
-        pred_output_dir_lstm = os.path.join(pred_output_dir) # 在此保存预测
+        logger.info("使用 LSTM 进行预测...")
+        # --- 获取 LSTM 特定配置 ---
+        lstm_cfg = cfg.model.prediction.lstm
+        lstm_input_type = lstm_cfg.get('input_type', 'bmu_rank') # 默认或从配置读取
+        target_field_name = dr_results.get('target_feature', 'salinity') # 获取目标特征名，可能需要从 dr_results 更可靠地获取
 
-        if lstm_input_type == 'bmu_rank':
+        # --- 检查输入类型兼容性 ---
+        if dr_method == 'som' and lstm_input_type != 'bmu_rank':
+            logger.warning(f"降维方法是 SOM，但 LSTM 输入类型配置为 '{lstm_input_type}' 而不是 'bmu_rank'。请检查配置。假设使用 BMU 索引。")
+            lstm_input_type = 'bmu_rank' # 强制或报错
+        elif dr_method in ['pca', 'autoencoder'] and lstm_input_type == 'bmu_rank':
+            logger.error(f"降维方法是 {dr_method} (连续)，但 LSTM 输入类型配置为 'bmu_rank'。不兼容。")
+            return results # 返回失败
+        # 可以添加对 'continuous' 或 'dv' 类型的处理逻辑，如果 train_lstm 支持的话
+        elif lstm_input_type not in ['bmu_rank']: # 目前假设只支持 bmu_rank
+             logger.error(f"当前实现的 LSTM 预测仅支持 'bmu_rank' 输入类型，但配置为 '{lstm_input_type}'。")
+             return results
+        
+        # --- 设置 LSTM 保存路径 ---
+        model_save_dir_lstm = pred_model_dir # 模型保存在方法组合目录下
+        # LSTM 通常不需要单独的 scaler 文件，内部处理 embedding
+        # scaler_save_path_lstm = os.path.join(config.paths.processed_data_dir, f"{dr_method}_lstm_input_scaler.pkl") # 可能不需要
+        pred_output_dir_lstm = pred_output_dir # 预测结果保存在方法组合目录下
+        prediction_filename_pattern = f"predicted_lstm_target_{target_field_name}_{{split}}.npy" # 预测文件名模式
+
+        # --- 调用 LSTM 训练和预测函数 ---
+        # 注意：train_and_predict_lstm 需要 low_dim_data_paths 的结构是 {feature: {split: {'positions': path}}}
+        # dr_results['low_dim_data_paths'] 的结构需要与此匹配。
+        # pipeline_new.py 中的 run_dimensionality_reduction (SOM部分) 应该已经生成了这种结构。
+        logger.info(f"传递给 LSTM 的低维数据路径结构: {low_dim_data_paths}") # 打印检查
+
+
+        try:
             pred_results = train_and_predict_lstm(
-                cfg,
-                low_dim_data_paths=low_dim_data_paths, # 来自降维步骤
+                cfg=cfg,
+                low_dim_data_paths=low_dim_data_paths, # 包含目标和（可选）观测特征的 BMU 路径
+                # target_field_name 和 input_feature_info 现在由 train_lstm 内部推断或从cfg读取
                 model_save_dir=model_save_dir_lstm,
-                scaler_save_path=scaler_save_path_lstm,
-                prediction_save_dir=pred_output_dir_lstm
-                # prediction_filename_pattern 可以使用默认值
+                prediction_save_dir=pred_output_dir_lstm,
+                prediction_filename_pattern=prediction_filename_pattern
             )
-            if pred_results: # 合并结果
-                results.update(pred_results)
+        except Exception as e:
+             logger.error(f"调用 train_and_predict_lstm 时发生错误: {e}", exc_info=True)
 
-                
-        elif lstm_input_type == 'dv':
-            logger.error(f"使用 LSTM 处理来自 {dr_method} 的离散低维输入的逻辑尚未实现。需要修改相关代码。")
-            results['success'] = False; return results
-            
+        # --- 处理 LSTM 返回结果 ---
+        if pred_results:
+            # 关键：将预测的 *目标* 低维路径存储到通用键中
+            if 'predicted_target_low_dim_paths' in pred_results:
+                results['predicted_low_dim_paths'] = pred_results['predicted_target_low_dim_paths']
+                results['model_path'] = pred_results.get('model_path') # 保存 LSTM 模型路径
+                results['success'] = True # 标记成功
+                logger.info(f"LSTM 预测成功，预测的目标路径: {results['predicted_low_dim_paths']}")
+            else:
+                logger.error("train_and_predict_lstm 未返回 'predicted_target_low_dim_paths'。")
+        else:
+            logger.error("train_and_predict_lstm 调用失败或未返回结果。")
 
     else:
         logger.error(f"未知的预测方法: {method}")
-        results['success'] = False; return results
 
-    if 'predicted_low_dim_paths' not in results or not results['predicted_low_dim_paths']:
-         logger.error("预测步骤未能生成预测的低维数据路径。")
-         results['success'] = False
-    else:
-         results['success'] = True
+    # --- 最终检查和日志 ---
+    if not results.get('success'): # <--- 因为 'success' 键不存在或不是 True，这里会执行
+        logger.error(f"预测阶段 ({method}) 失败。") # <--- 这就是你看到的错误日志
+    elif 'predicted_low_dim_paths' not in results or not results['predicted_low_dim_paths']:
+        logger.error(f"预测阶段 ({method}) 标记为成功，但缺少 'predicted_low_dim_paths'！")
+        results['success'] = False # 修正状态
 
-    logger.info(f"--- 预测完成 (方法: {method}) ---")
+    logger.info(f"--- 预测完成 (方法: {method}, 成功: {results.get('success')}) ---") # <--- 这里打印 "成功: None"
     return results
 
 def run_reconstruction(cfg: DictConfig, dr_results: Dict[str, Any], pred_results: Dict[str, Any]) -> Dict[str, Any]:
     """根据降维方法和预测的低维数据运行重建。"""
     config = DrprConfig.from_hydra_config(cfg)
     dr_method = dr_results['method']
-    pred_method = pred_results['method']
+    pred_method = pred_results['method'] # 获取预测方法
     logger.info(f"--- 阶段：重建 (DR: {dr_method}, Pred: {pred_method}) ---")
-    results = {}
+    results = {'success': False} # 初始化
 
     predicted_low_dim_paths = pred_results.get('predicted_low_dim_paths')
     dr_model_path = dr_results.get('model_path')
-    # 原始高维数据的 Scaler 路径 (来自 PCA/AE)
-    high_dim_scaler_path = dr_results.get('scaler_path')
+    high_dim_scaler_path = dr_results.get('scaler_path') # PCA/AE 的输入 Scaler
 
     if not predicted_low_dim_paths:
         logger.error("缺少预测的低维数据路径，无法重建。")
-        results['success'] = False; return results
+        return results
 
     recon_output_dir = os.path.join(config.paths.reconstructions_base_dir, f"{dr_method}_{pred_method}")
     os.makedirs(recon_output_dir, exist_ok=True)
     results['reconstructed_high_dim_paths'] = {}
 
     if dr_method == 'som':
-        # 重建需要预测的状态 BMU 秩/索引和状态 SOM 模型
+        # 重建需要预测的目标状态 BMU 和状态 SOM 模型
+        # 注意：即使预测是 LSTM，重建仍然依赖于 *状态* SOM
         state_som_model_path = dr_results.get('som_state', {}).get('model_path')
-        hmm_params_path = pred_results.get('model_path') # HMM 参数包含秩映射
-
         if not state_som_model_path:
-             logger.error("缺少状态 SOM 模型路径，无法进行 BMU 重建。")
-             results['success'] = False; return results
-        if not hmm_params_path and cfg.model.prediction.hmm.input_type == 'bmu_rank':
-             # 只有在输入是秩时才需要 HMM 参数进行映射
-             logger.warning("缺少 HMM 参数路径，并且 HMM 输入类型是 'bmu_rank'。无法将预测的秩转换为索引进行重建。")
-             results['success'] = False; return results
-        elif not hmm_params_path:
-             logger.warning("缺少 HMM 参数路径，将假设预测的 BMU 是线性索引。")
+            logger.error("缺少状态 SOM 模型路径，无法进行 BMU 重建。")
+            return results
+
+        # --- 条件化传递 hmm_params_path ---
+        hmm_params_path_for_recon = None
+        if pred_method == 'hmm':
+            # 只有 HMM 预测时才需要 HMM 参数进行可能的等级转换
+            hmm_params_path_for_recon = pred_results.get('model_path') # 获取 HMM 参数路径
+            if not hmm_params_path_for_recon:
+                 logger.warning("HMM 预测方法，但缺少 HMM 参数路径。假设预测是线性索引或重建函数能处理。")
+        # 如果 pred_method 是 'lstm'，则 hmm_params_path_for_recon 保持为 None
+
+        logger.info(f"开始 SOM 重建 (Pred: {pred_method})...")
+        logger.info(f"  状态 SOM 模型路径: {state_som_model_path}")
+        logger.info(f"  HMM 参数路径 (仅 HMM rank 输入时使用): {hmm_params_path_for_recon}")
+
+        # 获取目标特征的原始高维数据 scaler (通常是 'salinity_scaler.npy')
+        # 这个 scaler 是必须的，用于将 SOM 重建的结果反标准化回原始范围
+        target_feature_name = cfg.reconstruction.target_field # 例如 "salinity"
+        target_scaler_path = os.path.join(config.paths.processed_data_dir, f"{target_feature_name}_scaler.npy")
+        target_scaler_params = None
+        if os.path.exists(target_scaler_path):
+             try:
+                 # load_scaler 可能需要改进以加载 .npy 文件
+                 scaler_content = np.load(target_scaler_path, allow_pickle=True).item()
+                 if isinstance(scaler_content, dict) and 'mean' in scaler_content and 'std' in scaler_content:
+                      target_scaler_params = scaler_content
+                      logger.info(f"成功加载目标特征 '{target_feature_name}' 的 Scaler。")
+                 else:
+                      logger.warning(f"加载的目标特征 Scaler 文件格式不正确: {target_scaler_path}")
+             except Exception as e:
+                 logger.warning(f"加载目标特征 Scaler ({target_scaler_path}) 失败: {e}。将跳过反标准化。")
+        else:
+             logger.warning(f"未找到目标特征 Scaler 文件: {target_scaler_path}。将跳过反标准化。")
 
 
         for split, pred_path in predicted_low_dim_paths.items():
             logger.info(f"  重建 {split} 分割 (BMU)...")
             output_path = os.path.join(recon_output_dir, f"reconstructed_high_dim_{split}.npy")
             try:
-                reconstructed_flat = reconstruct_from_bmu( 
-                    cfg,
+                # 调用重建函数，根据 pred_method 条件传递 hmm_params_path
+                reconstructed_flat = reconstruct_from_bmu(
+                    cfg=cfg, # 传递 cfg 以便内部访问配置
                     som_model_path=state_som_model_path,
-                    predicted_bmu_path=pred_path, # 指向预测的状态秩/索引的路径
+                    predicted_bmu_path=pred_path, # 这是预测的目标 BMU 索引
                     output_path=output_path,
-                    # 只有当预测的是秩时才需要 HMM 参数
-                    hmm_params_path=hmm_params_path if cfg.model.prediction.hmm.input_type == 'bmu_rank' else None
+                    hmm_params_path=hmm_params_path_for_recon # <-- 条件传递
                 )
-                if reconstructed_flat is not None:
-                    # *** 反标准化需要高维数据的 Scaler ***
-                    salinity_scaler_path = os.path.join(config.paths.processed_data_dir, "salinity_scaler.npy")
-                    salinity_scaler_params = None
-                    if os.path.exists(salinity_scaler_path):
-                        try:
-                            # 使用现有函数加载 scaler (假设它处理按维度)
-                            salinity_scaler_params = load_scaler(cfg, "salinity")
-                        except Exception as e:
-                            logger.warning(f"加载 Salinity Scaler ({salinity_scaler_path}) 失败: {e}。跳过反标准化。")
 
-                    if salinity_scaler_params:
-                        logger.info(f"  对 {split} 重建结果执行反标准化...")
-                        # 假设 scaler_params['mean'] 和 ['std'] 是向量
-                        mean_vec = salinity_scaler_params['mean']
-                        std_vec = salinity_scaler_params['std']
-                        epsilon = 1e-8
-                        # 检查维度是否匹配
-                        if isinstance(mean_vec, np.ndarray) and mean_vec.ndim == 1 and len(mean_vec) == reconstructed_flat.shape[1]:
-                            reconstructed_inv_flat = reconstructed_flat * (std_vec + epsilon) + mean_vec
-                        elif np.isscalar(mean_vec): # 处理全局 scaler 的情况
-                            reconstructed_inv_flat = reconstructed_flat * (std_vec + epsilon) + mean_vec
-                        else:
-                             logger.error(f" Salinity Scaler 维度 ({mean_vec.shape if isinstance(mean_vec, np.ndarray) else type(mean_vec)}) 与重建特征 ({reconstructed_flat.shape[1]}) 不匹配。")
+                if reconstructed_flat is not None:
+                    # --- 反标准化 ---
+                    if target_scaler_params:
+                         logger.info(f"  对 {split} 重建结果执行反标准化...")
+                         mean_vec = target_scaler_params['mean']
+                         std_vec = target_scaler_params['std']
+                         epsilon = 1e-8
+
+                         # 检查维度匹配 (scaler vs 重建数据)
+                         if isinstance(mean_vec, np.ndarray) and mean_vec.ndim == 1 and len(mean_vec) == reconstructed_flat.shape[1]:
+                             reconstructed_inv_flat = reconstructed_flat * (std_vec + epsilon) + mean_vec
+                         elif np.isscalar(mean_vec): # 处理全局 scaler
+                             reconstructed_inv_flat = reconstructed_flat * (std_vec + epsilon) + mean_vec
+                         else:
+                             logger.error(f"目标特征 Scaler 维度 ({mean_vec.shape if isinstance(mean_vec, np.ndarray) else type(mean_vec)}) "
+                                          f"与重建特征 ({reconstructed_flat.shape[1]}) 不匹配。跳过反标准化。")
                              reconstructed_inv_flat = reconstructed_flat # 回退
                     else:
-                        reconstructed_inv_flat = reconstructed_flat # 没有 scaler
+                         reconstructed_inv_flat = reconstructed_flat # 没有 scaler，使用原始重建结果
 
-                    # 保存最终的（可能已反标准化的）扁平数据
-                    np.save(output_path, reconstructed_inv_flat) # 如果适用，用反标准化的结果覆盖
+                    # 保存最终的（可能反标准化的）扁平数据
+                    np.save(output_path, reconstructed_inv_flat)
                     results['reconstructed_high_dim_paths'][split] = output_path
                     logger.info(f"  {split} 重建的高维数据 (flat) 已保存: {output_path}")
                 else:
-                     logger.error(f"  {split} BMU 重建失败。")
+                    logger.error(f"  {split} BMU 重建失败 (reconstruct_from_bmu 返回 None)。")
 
             except Exception as e:
-                logger.error(f"  重建 {split} (BMU) 失败: {e}", exc_info=True)
+                logger.error(f"  重建 {split} (BMU) 出错: {e}", exc_info=True)
 
     elif dr_method in ['pca', 'autoencoder']:
          # --- 使用 DR 模型进行逆变换 ---
@@ -565,8 +652,8 @@ def run_evaluation(cfg: DictConfig, recon_results: Dict[str, Any], dr_method: st
                  logger.warning(f"{split}: 重建样本数 ({n_recon_samples}) 大于原始样本数 ({n_orig_samples})。将截断重建数据。")
                  recon_flat = recon_flat[:n_orig_samples]
             elif n_recon_samples < n_orig_samples:
-                 logger.warning(f"{split}: 重建样本数 ({n_recon_samples}) 小于原始样本数 ({n_orig_samples})。将使用前 {n_recon_samples} 个原始样本进行比较。")
-                 orig_split_raw = orig_split_raw[:n_recon_samples]
+                 logger.warning(f"{split}: 重建样本数 ({n_recon_samples}) 小于原始样本数 ({n_orig_samples})。将使用后 {n_recon_samples} 个原始样本进行比较。")
+                 orig_split_raw = orig_split_raw[-n_recon_samples:]
 
 
             # --- 比较重建数据和原始数据 ---
@@ -672,7 +759,7 @@ def run_evaluation(cfg: DictConfig, recon_results: Dict[str, Any], dr_method: st
 
 
             # --- (可选) 计算并绘制: 空间相关性图 (Cartopy) ---
-            if cfg.evaluation.get("calculate_correlation", True): # 添加配置开关
+            if cfg.evaluation.get("calculate_correlation", False): # 添加配置开关
                  logger.info(f"  计算空间相关性图 ({split})...")
                  try:
                      # 注意 calculate_correlation_map 需要 mask=True 表示无效
@@ -695,7 +782,7 @@ def run_evaluation(cfg: DictConfig, recon_results: Dict[str, Any], dr_method: st
 
 
             # --- (可选) 绘制: 特定时间点的对比和差异图 (Cartopy) ---
-            if cfg.evaluation.visualization.get("plot_instantaneous", True): # 添加配置开关
+            if cfg.evaluation.visualization.get("plot_instantaneous", False): # 添加配置开关
                  time_indices_to_plot = cfg.evaluation.visualization.get("time_indices_to_plot", [0, n_recon_samples // 2, n_recon_samples - 1])
                  logger.info(f"  绘制特定时间点的空间图 ({split}, indices={time_indices_to_plot})...")
                  for t_idx in time_indices_to_plot:
