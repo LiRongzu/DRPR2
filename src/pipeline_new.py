@@ -18,7 +18,16 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from src.utils.hydra_config import DrprConfig
-from src.evaluation.visualization import plot_time_series_comparison, plot_spatial_rmse
+from src.evaluation.visualization import (
+    plot_time_series_comparison,
+    plot_spatial_rmse,
+    plot_spatial_comparison_at_timestep, # 新增：绘制特定时间点对比图
+    plot_spatial_difference,            # 新增：绘制特定时间点差异图
+    plot_spatial_statistic,             # 新增：绘制通用空间统计图
+    calculate_correlation_map,          # 新增：计算相关性图的函数
+    generate_evaluation_report,         # 新增：生成评估报告的函数
+    plot_spatial_distribution            # 如果需要 heatmap 也导入
+)
 from src.utils.model_utils import get_device_from_config  
 from src.dimensionality_reduction.som_pytorch import SOMTorch
 from src.utils.data_loader import load_raw_data, load_mask, load_scaler, load_split_indices
@@ -36,16 +45,11 @@ logger = logging.getLogger(__name__)
 def set_global_seeds(seed):
     if seed is None:
         logger.warning("未提供随机种子，结果可能不可重现")
-        return
-        
+        return 
     logger.info(f"设置全局随机种子: {seed}")
-    
     random.seed(seed)
-    
     np.random.seed(seed)
-    
     torch.manual_seed(seed)
-    
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
@@ -53,7 +57,7 @@ def set_global_seeds(seed):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         logger.info("已设置CUDA随机种子")
-    
+
     logger.info("全局随机种子设置完成")
 
 # === Pipeline 各阶段的辅助函数 ===
@@ -63,88 +67,176 @@ def run_dimensionality_reduction(cfg: DictConfig) -> Dict[str, Any]:
     config = DrprConfig.from_hydra_config(cfg)
     method = cfg.model.dimensionality_reduction.method
     logger.info(f"--- 阶段：维度降低 (方法: {method}) ---")
-    results = {'method': method}
-    dr_results = None
+    results = {'method': method, 'success': False} # Initialize success to False
+    dr_results = None # For PCA/AE results
+    primary_bmu_paths = {} # Store the main BMU paths needed for prediction
 
-    # --- 定义降维所需的路径 ---
-    # 指向处理后的高维数据路径 (PCA/AE 的输入)
-    # 假设盐度是降维目标 (如果可变，需要修改)
-    target_field_dr = "salinity"
-    high_dim_paths = {}
-    for split in ["train", "val", "test"]:
-         # 构建路径，例如使用 cfg.paths.processed_data_dir 和命名约定
-         # 假设存在像 train_salinity_processed.npy 这样的预处理数据
-         try:
-             path = os.path.join(config.paths.processed_data_dir, f"{split}_{target_field_dr}_processed.npy")
-             if os.path.exists(path):
-                 high_dim_paths[split] = path
-         except Exception as e:
-             logger.warning(f"无法构造 {split} 的高维数据路径: {e}")
-
-    if 'train' not in high_dim_paths:
-        logger.error("缺少用于降维的高维训练数据路径。")
-        return results # 返回部分结果表示失败
-
-    # --- 降维模型输出的通用路径 ---
-    dr_model_dir = os.path.join(config.paths.models_base_dir, method) # 例如 models/som, models/pca
+    # --- 定义降维所需的路径 (通用) ---
+    target_field_dr = cfg.model.dimensionality_reduction.get("target_feature", "salinity") # Target for state DR
+    dr_model_dir = os.path.join(config.paths.models_base_dir, method)
     os.makedirs(dr_model_dir, exist_ok=True)
-    dr_scaler_path = os.path.join(config.paths.processed_data_dir, f"{method}_{target_field_dr}_input_scaler.pkl") # 高维输入的 Scaler
-    transformed_data_dir = os.path.join(config.paths.processed_data_dir, f"{method}_{target_field_dr}_low_dim") # 在此存储低维数据
+    transformed_data_dir = os.path.join(config.paths.processed_data_dir, f"{method}_{target_field_dr}_low_dim")
     os.makedirs(transformed_data_dir, exist_ok=True)
 
+    # --- High-dim paths (needed for PCA/AE) ---
+    high_dim_paths = {}
+    for split in ["train", "val", "test"]:
+        try:
+            path = os.path.join(config.paths.processed_data_dir, f"{split}_{target_field_dr}_processed.npy")
+            if os.path.exists(path):
+                high_dim_paths[split] = path
+        except Exception as e:
+            logger.warning(f"无法构造 {split} 的高维数据路径 ({target_field_dr}): {e}")
+
+    # --- Specific DR Method Logic ---
     if method == 'som':
+        som_state_results = None
+        som_obs_results = None
+        state_bmu_positions = {}
+        obs_bmu_positions = {}
+
+        # --- Train State SOM (e.g., salinity) ---
+        # Always run state SOM for now, needed for reconstruction
+        logger.info(f"训练状态 SOM ({target_field_dr})...")
         som_state_results = train_single_feature_som(cfg, feature_name=target_field_dr)
-        if not som_state_results: raise RuntimeError("状态 SOM 训练失败")
-        results['som_state'] = som_state_results
+        logger.info(f"状态 SOM 返回结果: {som_state_results}") # Log the result
 
-        # 目前假设 BMU 索引是 HMM 的主要输出
-        # 如果 LSTM 需要，可能需要单独生成距离向量
-        # HMM 输入需要 BMU 文件路径
-        # bmu_paths 字典在 som_state_results['bmu_paths'] 中
-        
-        bmu_paths_state = som_state_results.get('bmu_paths', {})
-        results['low_dim_data_paths'] = {split: p.get('positions') for split, p in bmu_paths_state.items() if p.get('positions')}
-        results['low_dim_dv_paths'] = som_state_results.get('dv_paths', {})
+        if som_state_results and isinstance(som_state_results, dict):
+            results['som_state'] = som_state_results
+            bmu_paths_state = som_state_results.get('bmu_indices_paths', {})
+            if bmu_paths_state:
+                 try:
+                     # Ensure inner dict and 'positions' key exist
+                     state_bmu_positions = {split: p['positions'] for split, p in bmu_paths_state.items() if isinstance(p, dict) and 'positions' in p and p['positions']}
+                     logger.info(f"提取的状态 BMU 位置路径: {state_bmu_positions}")
+                 except Exception as e:
+                     logger.error(f"从状态 SOM 结果提取 BMU 位置路径时出错: {e}", exc_info=True)
+            else:
+                 logger.warning("状态 SOM 结果中未找到 'bmu_indices_paths' 或其为空。")
+            results['low_dim_dv_paths'] = som_state_results.get('dv_paths', {})
+            results['model_path'] = som_state_results.get('model_path') # State SOM model path for reconstruction
+        else:
+            logger.error("状态 SOM 训练失败或未返回有效字典。")
+            # State SOM failure is likely fatal for reconstruction
+            results['success'] = False
+            logger.info(f"--- 降维完成 (方法: {method}) ---")
+            return results
 
-        results['model_path'] = som_state_results.get('model_path')
-        # 在此设置中，SOM 不使用单独的高维输入缩放器
 
-        # 处理 HMM 的观测 SOM
+        # --- Train Observation SOM (if prediction is HMM) ---
         if cfg.model.prediction.method == 'hmm':
             observation_features = list(cfg.model.prediction.hmm.observation_features)
-            obs_feature_name = "_".join(sorted(observation_features))
-            if len(observation_features) == 2:
-                som_obs_results = train_combined_feature_som(cfg, output_feature_name=obs_feature_name)
-            elif len(observation_features) == 1:
-                cfg.training.som.map_size = cfg.training.som.map_size_obs
+            if not observation_features:
+                 logger.error("HMM 预测方法已选择，但未在配置中指定 observation_features。")
+                 raise ValueError("HMM 需要 observation_features 配置。")
+
+            obs_feature_name = "_".join(sorted(observation_features)) # e.g., "flow_wind"
+            logger.info(f"训练观测 SOM ({obs_feature_name}) for HMM...")
+
+            # Temporarily set map size for observation SOM from config if different
+            original_map_size = cfg.training.som.map_size
+            map_size_obs = cfg.training.som.get("map_size_obs", original_map_size) # Get obs size or default
+            if map_size_obs != original_map_size:
+                 logger.info(f"临时为观测 SOM 设置地图大小: {map_size_obs}")
+                 cfg.training.som.map_size = map_size_obs # Use obs map size
+
+            if len(observation_features) == 1:
                 som_obs_results = train_single_feature_som(cfg, feature_name=observation_features[0])
+            else: # Combined features
+                som_obs_results = train_combined_feature_som(cfg, output_feature_name=obs_feature_name)
+
+            # Restore original map size in config if it was changed
+            if map_size_obs != original_map_size:
+                 cfg.training.som.map_size = original_map_size
+                 logger.info(f"恢复 SOM 地图大小为: {original_map_size}")
+
+            logger.info(f"观测 SOM 返回结果: {som_obs_results}") # Log the result
+
+            if som_obs_results and isinstance(som_obs_results, dict):
+                results['som_observation'] = som_obs_results
+                bmu_paths_obs = som_obs_results.get('bmu_indices_paths', {})
+                if bmu_paths_obs:
+                    try:
+                        # Ensure inner dict and 'positions' key exist
+                        obs_bmu_positions = {split: p['positions'] for split, p in bmu_paths_obs.items() if isinstance(p, dict) and 'positions' in p and p['positions']}
+                        logger.info(f"提取的观测 BMU 位置路径: {obs_bmu_positions}")
+                    except Exception as e:
+                        logger.error(f"从观测 SOM 结果提取 BMU 位置路径时出错: {e}", exc_info=True)
+                else:
+                    logger.warning("观测 SOM 结果中未找到 'bmu_indices_paths' 或其为空。")
+                results['som_observation_model_path'] = som_obs_results.get('model_path') # Store obs SOM model path
             else:
-                raise ValueError("无效的 HMM 观测特征配置")
-            if not som_obs_results: raise RuntimeError("观测 SOM 训练失败")
-            results['som_observation'] = som_obs_results
+                # If HMM is the predictor, observation SOM is essential
+                logger.error("观测 SOM 训练失败或未返回有效字典 (HMM 需要)。")
+                results['success'] = False # Mark as failed
+                logger.info(f"--- 降维完成 (方法: {method}) ---") # Log completion before returning
+                return results
+
+
+        if cfg.model.prediction.method == 'hmm':
+            if obs_bmu_positions:
+                primary_bmu_paths = obs_bmu_positions
+                logger.info("将观测 SOM BMU 位置设置为主要低维数据路径 (for HMM)。")
+                results['success'] = True
+            else:
+                logger.error("HMM 模式下未能获取观测 BMU 位置路径。")
+                # Failure should have been caught above, but set success=False just in case
+                results['success'] = False
+        else: # Not HMM (e.g., LSTM using state BMUs)
+            if state_bmu_positions:
+                primary_bmu_paths = state_bmu_positions
+                logger.info("将状态 SOM BMU 位置设置为主要低维数据路径。")
+            else:
+                logger.error("非 HMM 模式下未能获取状态 BMU 位置路径。")
+                # If state SOM failed earlier, success should already be False
+                results['success'] = False
+
+
+        if primary_bmu_paths and results.get('success', True) is not False : # Check if paths exist AND no fatal error occurred
+             results['low_dim_data_paths'] = primary_bmu_paths
+             logger.info(f"最终设置的 low_dim_data_paths: {primary_bmu_paths}")
+             results['success'] = True # Explicitly set success if paths are assigned
+        elif results.get('success', True) is not False: # If no fatal error, but paths are missing
+             logger.error("未能确定主要的低维数据路径 (BMU positions)。")
+             results['success'] = False # Mark failure if paths are missing
+
 
     elif method == 'pca':
+        # ... (PCA logic remains the same) ...
+        # Ensure PCA logic sets results['success'] and results['low_dim_data_paths']
+        if 'train' not in high_dim_paths:
+             logger.error("缺少用于 PCA 的高维训练数据路径。")
+             results['success'] = False
+             return results
         model_path = os.path.join(dr_model_dir, f"pca_model_{target_field_dr}.pkl")
+        dr_scaler_path = os.path.join(config.paths.processed_data_dir, f"pca_{target_field_dr}_input_scaler.pkl")
         dr_results = train_and_transform_pca(
             cfg, high_dim_paths, model_path, dr_scaler_path, transformed_data_dir
         )
-    elif method == 'autoencoder':
-        model_path = os.path.join(dr_model_dir, f"ae_model_{target_field_dr}.pt")
-        dr_results = train_and_transform_ae(
-            cfg, high_dim_paths, model_path, dr_scaler_path, transformed_data_dir
-        )
+        if dr_results:
+            results.update(dr_results)
+            # Check if train_and_transform_pca sets 'low_dim_data_paths' and 'success'
+            if 'low_dim_data_paths' in dr_results and dr_results.get('success', False):
+                results['success'] = True
+            else:
+                results['success'] = False
+        else:
+            results['success'] = False
     else:
         logger.error(f"未知的降维方法: {method}")
-        return results
+        results['success'] = False
 
-    if dr_results: # 合并 PCA/AE 调用的结果
-        results.update(dr_results)
 
-    if 'low_dim_data_paths' not in results or not results['low_dim_data_paths']:
-         logger.error("降维步骤未能生成低维数据路径。")
-         results['success'] = False
+    # --- Final Check and Logging ---
+    if results.get('success', False):
+         if 'low_dim_data_paths' in results and results['low_dim_data_paths']:
+              logger.info(f"成功生成低维数据路径: {results['low_dim_data_paths']}")
+         else:
+              logger.error("降维标记为成功，但 low_dim_data_paths 为空或缺失！")
+              results['success'] = False # Correct the status
     else:
-         results['success'] = True
+         logger.error("降维步骤未能生成低维数据路径或遇到致命错误。")
+
 
     logger.info(f"--- 降维完成 (方法: {method}) ---")
     return results
@@ -211,8 +303,7 @@ def run_prediction(cfg: DictConfig, dr_results: Dict[str, Any]) -> Dict[str, Any
                 # 1. 修改 train_hmm.py 以使用 GaussianHMM 并在 continuous low_dim_data_paths 上拟合
                 # 2. 调用修改后的 HMM 训练函数
                 # 3. HMM 将预测低维向量序列 (隐藏状态的均值)
-                # pred_results = run_gaussian_hmm_training(...)
-                # results['predicted_low_dim_paths'] = pred_results['predicted_vector_paths']
+
             elif hmm_input_type == 'discrete':
                  logger.error(f"将来自 {dr_method} 的连续低维输入离散化以用于 CategoricalHMM 的逻辑尚未实现。需要在 Pipeline 中添加 K-Means 或类似步骤。")
                  results['success'] = False; return results
@@ -230,7 +321,6 @@ def run_prediction(cfg: DictConfig, dr_results: Dict[str, Any]) -> Dict[str, Any
     elif method == 'lstm':
         dr_method = dr_results['method']
         lstm_input_type = cfg.model.prediction.lstm.get('input_type')
-
         model_save_dir_lstm = os.path.join(pred_model_dir) # 在此保存 LSTM 模型
         scaler_save_path_lstm = os.path.join(config.paths.processed_data_dir, f"{dr_results['method']}_lstm_input_scaler.pkl")
         pred_output_dir_lstm = os.path.join(pred_output_dir) # 在此保存预测
@@ -511,16 +601,16 @@ def run_evaluation(cfg: DictConfig, recon_results: Dict[str, Any], dr_method: st
                  continue
 
             # --- 计算指标 ---
+            logger.info(f"  计算 RMSE 和 MAE ({split})...")
             metrics = {}
             rmse_field = np.full(target_spatial_shape, np.nan) if target_spatial_shape is not None else None
-
+            
             if boolean_mask is not None and target_spatial_shape is not None:
                  # --- 重塑回空间网格进行比较 ---
                  recon_spatial = np.full((n_recon_samples,) + target_spatial_shape, np.nan)
                  orig_spatial_masked = np.full((n_recon_samples,) + target_spatial_shape, np.nan)
                  # 使用 boolean_flat_mask (True=有效) 来放置数据
                  temp_flat_base = np.full(boolean_mask.size, np.nan) # 创建基础 NaN 数组
-
                  for t in range(n_recon_samples):
                       temp_flat = temp_flat_base.copy() # 每次重置
                       temp_flat[boolean_flat_mask] = recon_flat[t] # 放入有效位置
@@ -544,10 +634,10 @@ def run_evaluation(cfg: DictConfig, recon_results: Dict[str, Any], dr_method: st
                       mae_val = np.mean(np.abs(diff[:, boolean_mask]))
 
                       # 计算空间 RMSE 图
-                      mean_diff_sq_spatial = np.nanmean(np.square(diff), axis=0) # 在时间轴上平均，忽略 NaN
+                      mean_diff_sq_spatial = np.nanmean(np.square(diff[:, boolean_mask]), axis=0) 
                       # valid_spatial_points = boolean_mask # 有效点由 boolean_mask 定义
                       if np.any(boolean_mask):
-                           rmse_field[boolean_mask] = np.sqrt(mean_diff_sq_spatial[boolean_mask])
+                           rmse_field[boolean_mask] = np.sqrt(mean_diff_sq_spatial)
 
                       metrics = {
                            "mean_rmse": float(mean_rmse_val), "mean_mae": float(mae_val),
@@ -558,17 +648,7 @@ def run_evaluation(cfg: DictConfig, recon_results: Dict[str, Any], dr_method: st
                  else:
                       # ... (处理没有有效点的情况) ...
                       metrics = {k: np.nan for k in ["mean_rmse", "mean_mae", "max_rmse", "min_rmse"]}
-                      metrics["rmse_map"] = rmse_field # 仍然返回全 NaN 的图
-            else: # 无法进行空间指标计算
-                 # ... (计算扁平化数据的 RMSE/MAE) ...
-                 # 假设 recon_flat 和 orig_for_comparison 已经是有效点数据
-                 diff_flat = recon_flat - orig_for_comparison
-                 # 不需要再次检查 NaN，因为它们应该只包含有效点
-                 if diff_flat.size > 0: # 确保数组不为空
-                      metrics = {"mean_rmse": np.sqrt(np.mean(np.square(diff_flat))),
-                                 "mean_mae": np.mean(np.abs(diff_flat))}
-                 else: metrics = {"mean_rmse": np.nan, "mean_mae": np.nan}
-
+                      metrics["rmse_map"] = rmse_field 
 
             # --- 保存指标和生成图表 ---
             eval_output_dir = os.path.join(config.paths.evaluation_base_dir, f"{dr_method}_{pred_method}", split)
@@ -577,7 +657,6 @@ def run_evaluation(cfg: DictConfig, recon_results: Dict[str, Any], dr_method: st
             np.save(metrics_path, metrics)
             logger.info(f"  评估指标 ({split}) 已保存到: {metrics_path}")
 
-            # ... (生成图表的代码，使用新的标题包含方法组合) ...
             if metrics.get("mean_rmse") is not np.nan:
                  rec_mean_ts = np.nanmean(recon_flat, axis=1)
                  orig_mean_ts = np.nanmean(orig_for_comparison, axis=1)
@@ -590,6 +669,66 @@ def run_evaluation(cfg: DictConfig, recon_results: Dict[str, Any], dr_method: st
                      plot_spatial_rmse(rmse_field, cfg=cfg, mask=boolean_mask, save_path=spatial_rmse_save_path,
                                        title=f"Spatial RMSE ({split} - {dr_method}_{pred_method})")
                  logger.info(f"  评估图表 ({split}) 已保存到: {eval_output_dir}")
+
+
+            # --- (可选) 计算并绘制: 空间相关性图 (Cartopy) ---
+            if cfg.evaluation.get("calculate_correlation", True): # 添加配置开关
+                 logger.info(f"  计算空间相关性图 ({split})...")
+                 try:
+                     # 注意 calculate_correlation_map 需要 mask=True 表示无效
+                     corr_map = calculate_correlation_map(recon_spatial, orig_spatial_masked, mask)
+                     metrics['correlation_map'] = corr_map
+                     metrics['mean_correlation'] = float(np.nanmean(corr_map)) if np.any(np.isfinite(corr_map)) else np.nan
+                     logger.info(f"  {split} - Mean Correlation: {metrics['mean_correlation']:.6f}")
+
+                     if cfg.evaluation.visualization.get("plot_spatial_correlation", True):
+                         logger.info(f"  绘制空间相关性图 (Cartopy) ({split})...")
+                         corr_save_path = os.path.join(eval_output_dir, f"spatial_correlation_{split}.png")
+                         # plot_spatial_statistic 需要 mask=True 表示无效
+                         plot_spatial_statistic(corr_map, cfg, mask, corr_save_path,
+                                                title=f"Spatial Correlation ({split} - {dr_method}_{pred_method})",
+                                                cmap='coolwarm', vmin=-1, vmax=1, cbar_label="Correlation Coeff.")
+                        #  figure_paths_split.append(corr_save_path)
+
+                 except Exception as e:
+                     logger.error(f"  计算或绘制空间相关性图失败 ({split}): {e}", exc_info=True)
+
+
+            # --- (可选) 绘制: 特定时间点的对比和差异图 (Cartopy) ---
+            if cfg.evaluation.visualization.get("plot_instantaneous", True): # 添加配置开关
+                 time_indices_to_plot = cfg.evaluation.visualization.get("time_indices_to_plot", [0, n_recon_samples // 2, n_recon_samples - 1])
+                 logger.info(f"  绘制特定时间点的空间图 ({split}, indices={time_indices_to_plot})...")
+                 for t_idx in time_indices_to_plot:
+                     if 0 <= t_idx < n_recon_samples:
+                         try:
+                             orig_t = np.full(target_spatial_shape, np.nan) if target_spatial_shape is not None else None
+                             recon_t = np.full(target_spatial_shape, np.nan) if target_spatial_shape is not None else None
+                             diff_t = np.full(target_spatial_shape, np.nan) if target_spatial_shape is not None else None
+                             orig_t[boolean_mask] = orig_spatial_masked[t_idx, boolean_mask]
+                             recon_t[boolean_mask] = recon_spatial[t_idx, boolean_mask]
+                             diff_t[boolean_mask] = diff[t_idx, boolean_mask]
+
+                             # 并排对比图
+                             comp_save_path = os.path.join(eval_output_dir, f"spatial_comparison_{split}_t{t_idx}.png")
+                             plot_spatial_comparison_at_timestep(
+                                 orig_t, recon_t, diff_t,
+                                 cfg, mask, t_idx, comp_save_path, # plot 函数需要 mask=True 表示无效
+                                 title_prefix=f"Spatial Comparison ({split} - {dr_method}_{pred_method})"
+                             )
+
+                             # (可选) 单独的差异图
+                             if cfg.evaluation.visualization.get("plot_instantaneous_difference_only", True):
+                                 diff_save_path = os.path.join(eval_output_dir, f"spatial_difference_{split}_t{t_idx}.png")
+                                 plot_spatial_difference(
+                                     diff_t, cfg, mask, t_idx, diff_save_path, # plot 函数需要 mask=True 表示无效
+                                     title=f"Spatial Difference ({split} - {dr_method}_{pred_method})"
+                                 )
+                                #  figure_paths_split.append(diff_save_path)
+
+                         except Exception as e:
+                             logger.error(f"  绘制瞬时图失败 (t={t_idx}, split={split}): {e}", exc_info=True)
+
+
 
             # 存储此分割的结果
             all_eval_results[split] = {'metrics': metrics}

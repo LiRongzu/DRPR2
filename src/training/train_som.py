@@ -287,7 +287,7 @@ def combine_features(
             import traceback
             logger.error(traceback.format_exc())
         
-        return combined_features_dict
+    return combined_features_dict
 
 def train_combined_feature_som(cfg: DictConfig, output_feature_name: str = "wind_flow") -> Dict[str, Any]:
     """
@@ -373,7 +373,6 @@ def train_combined_feature_som(cfg: DictConfig, output_feature_name: str = "wind
     bmu_paths_combined = {}
     
     for split in splits:
-        # 跳过没有加载的分割
         if split not in combined_features_dict:
             continue
             
@@ -420,7 +419,7 @@ def train_combined_feature_som(cfg: DictConfig, output_feature_name: str = "wind
         'training_time': training_time,
         'bmu_generation_time': bmu_generation_time,
         # --- MODIFICATION START ---
-        'bmu_indices_paths': bmu_paths_combined # Change key from 'bmu_paths' to 'bmu_indices_paths'
+        'bmu_indices_paths': bmu_paths_combined 
         # --- MODIFICATION END ---
     }
 
@@ -590,40 +589,63 @@ def generate_and_save_dvs(
 
 
 @hydra.main(version_base=None, config_path="../../conf", config_name="config")
-def main(cfg: DictConfig) -> None:
-    """主函数入口"""
+def main(cfg: DictConfig) -> Optional[Dict[str, Any]]: # Modified return type hint
+    # \"\"\"主函数入口，执行SOM训练并返回结果字典\"\"\"
     # 解析命令行参数，确定要训练哪些特征的 SOM
     feature_to_train = cfg.get("feature_to_train", "salinity")
 
     # 确保路径目录存在
     config = DrprConfig.from_hydra_config(cfg)
-    os.makedirs(config.paths.som_models_dir, exist_ok=True)
-    os.makedirs(config.paths.bmu_base_dir, exist_ok=True)
-    # Ensure dv_base_dir exists as well
-    if hasattr(config.paths, "dv_base_dir"):
-        os.makedirs(config.paths.dv_base_dir, exist_ok=True)
-    else:
-        logger.warning("配置中缺少 'paths.dv_base_dir'，DV 文件将保存在当前目录或由函数内部处理。")
+    # Create directories safely
+    try:
+        os.makedirs(config.paths.som_models_dir, exist_ok=True)
+        os.makedirs(config.paths.bmu_base_dir, exist_ok=True)
+        if hasattr(config.paths, "dv_base_dir"):
+            os.makedirs(config.paths.dv_base_dir, exist_ok=True)
+        else:
+            logger.warning("配置中缺少 'paths.dv_base_dir'，DV 文件可能无法正确保存。")
+    except Exception as e:
+        logger.error(f"创建输出目录时出错: {e}")
+        return None # Cannot proceed without output directories
 
-
+    results = None # Initialize results
     # 根据指定特征选择训练函数
     if (feature_to_train == "all"):
         logger.info("训练所有特征的 SOM 模型")
-        results = train_multiple_soms(cfg)
+        # Placeholder: Assuming train_multiple_soms exists and returns results
+        # results = train_multiple_soms(cfg)
+        logger.warning("训练 'all' 特征的功能尚未在此代码片段中完全实现。")
+        # For now, return None or handle appropriately
+        return None
     elif (feature_to_train == "wind_flow"):
         logger.info("训练 wind_flow 组合特征的 SOM 模型")
-        results = train_combined_feature_som(cfg, "wind_flow")
+        # Use the actual feature name from config if possible, or keep default
+        output_feature_name = cfg.training.get("combined_feature_name", "wind_flow")
+        results = train_combined_feature_som(cfg, output_feature_name)
     else:
+        # Ensure feature_to_train is a valid single feature name based on config or data
+        # Add validation if necessary
         logger.info(f"训练 {feature_to_train} 特征的 SOM 模型")
         results = train_single_feature_som(cfg, feature_to_train)
-    
-    # 检查结果
-    if not results:
-        logger.error("SOM 模型训练失败")
-        sys.exit(1)
-    
-    logger.info("SOM 模型训练完成")
-    sys.exit(0)
+
+    # 检查结果 - Check if results exist and contain the expected paths
+    # A more robust check might be needed depending on what the caller expects
+    if results and (results.get('bmu_indices_paths') or results.get('dv_paths')):
+        logger.info("SOM 模型训练和数据生成成功完成")
+        return results # Return the results dictionary on success
+    else:
+        logger.error("SOM 模型训练或数据生成失败，未能获取必要路径。")
+        return None # Return None or an empty dict on failure
+
 
 if __name__ == "__main__":
-    main()
+    # When run as a script, call main and handle exit code based on the return value
+    final_results = main()
+    if final_results:
+        logger.info("train_som.py 脚本执行成功。")
+        # Optionally print a summary of results
+        # print("Generated paths:", final_results)
+        sys.exit(0) # Exit with success code
+    else:
+        logger.error("train_som.py 脚本执行失败。")
+        sys.exit(1) # Exit with error code

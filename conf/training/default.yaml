@@ -21,16 +21,14 @@ early_stopping:
 
 # --- SOM训练参数 ---
 som:
-  map_size_sta : [6,6]
-  map_size: [9,9] # 提供sal的地图尺寸
-  map_size_obs : [9,9] # 提供obs的地图尺寸
+  map_size_sta : [3,3]
+  map_size: [3,3] # 提供sal的地图尺寸
+  map_size_obs : [3,3] # 提供obs的地图尺寸
   learning_rate: 0.1
   n_iterations: 200
   neighborhood_size: null
-  sigma: 1.5
+  sigma: 1.25
 
-# --- 随机种子 ---
-random_seed: 42
 
 # --- 日志配置 ---
 logging:

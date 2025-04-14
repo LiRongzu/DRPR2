@@ -59,10 +59,6 @@ def train_and_predict_lstm(
     # --- 1. 确定输入特征和顺序 ---
     # 确保 target 在第一个位置，以便后续处理
     target_field_name = "salinity"
-    # --- MODIFICATION START: Correctly get feature names from the dictionary keys ---
-    # feature_names_ordered = [target_field_name] + \
-    #                         [f for f in low_dim_data_paths.keys() if f != target_field_name]
-    # Get actual feature names present in the loaded data dictionary
     actual_features = list(low_dim_data_paths.keys())
     if target_field_name not in actual_features:
         logger.error(f"Target field '{target_field_name}' not found in the keys of low_dim_data_paths: {actual_features}")
@@ -75,7 +71,6 @@ def train_and_predict_lstm(
     logger.info(f"目标特征 '{target_field_name}' 在索引 {target_feature_index}")
 
     # --- 动态构建 input_feature_info ---
-    # Initialize with the target feature
     try:
         input_feature_info = {
             target_field_name: {
