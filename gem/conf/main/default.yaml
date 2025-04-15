@@ -1,0 +1,16 @@
+# Default configuration for main workflow
+run_steps:
+  - preprocess_raw
+  - train_som
+  - train_manifold
+  - train_lstm
+  - predict_lstm
+  - reconstruct_manifold
+
+# Optional flags and settings for main workflow control
+enable_logging: true
+save_intermediate: true
+
+# Error handling and reporting
+stop_on_error: true
+report_metrics: true

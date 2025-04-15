@@ -15,6 +15,8 @@ evaluation_base_dir: ${paths.hydra_run_dir}/evaluation
 # --- Specific Output Directories ---
 som_models_dir: ${paths.models_base_dir}/som
 hmm_params_dir: ${paths.params_base_dir}/hmm
+pca_models_dir: /home/lirz6/PROGRAM/DRPR/data/pca/model
+pca_components_dir: /home/lirz6/PROGRAM/DRPR/data/pca/components
 reconstructed_bmu_dir: ${paths.reconstructions_base_dir}/bmu
 reconstructed_dv_dir: ${paths.reconstructions_base_dir}/dv
 predicted_states_dir: ${paths.predictions_base_dir}/hmm

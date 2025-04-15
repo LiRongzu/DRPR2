@@ -1,7 +1,8 @@
 # conf/model/default.yaml
 # --- 选择降维方法 ---
 dimensionality_reduction:
-  method: som # 可选项: som, pca, autoencoder
+  target_feature: "salinity" # 目标特征
+  method: pca # 可选项: som, pca, autoencoder
   som: # 如果 method 是 som，保留 SOM 特定参数
     # map_size 现在在 training 配置中
     learning_rate: 0.1
@@ -13,6 +14,7 @@ dimensionality_reduction:
       patience: 5
   pca: # 添加 PCA 特定参数
      n_components: 20 # 示例值
+     target_features: ["wind", "salinity"] # 示例值
   autoencoder: # 添加 Autoencoder 特定参数
      encoding_dim: 15 # 示例值
      hidden_layers: [64, 32] # 示例值
@@ -24,7 +26,7 @@ dimensionality_reduction:
 prediction:
   method: lstm # 可选项: hmm, lstm
   lstm: # 如果 method 是 lstm，保留 LSTM 参数
-      input_type: bmu_rank # 也可以是continuous_vector
+      input_type: bmu_rank # 也可以是continuous_vector、 continuous、 bmu_rank
       hidden_size: 64
       num_layers: 2
       dropout: 0.1
@@ -37,22 +39,31 @@ prediction:
       use_observation_features: true   # 控制开关
       observation_features: ['flow', 'wind'] # 指定哪些是观测特征 (如果 use_observation_features=true)
 
+  lstm_pca:
+      # List of features whose PCA components are used as LSTM input
+      input_features: ["wind", "salinity"] # Example: use both wind and salinity PCA components
+      # input_features: ["wind"]           # Example: use only wind PCA components
+      # input_features: ["salinity"]       # Example: use only salinity PCA components
+
+      # Feature whose PCA components the LSTM should predict
+      target_feature: "salinity"
+      external_features: ["flow"]
+      # Inherit or define specific LSTM hyperparameters for this workflow
+      sequence_length: ${model.prediction.lstm.sequence_length} # Inherit general LSTM param
+      hidden_size: 32                   # Or define specific value
+      num_layers: 2
+      patience: 100
+      learning_rate: 0.001
+      num_epochs: 100
+      batch_size: 32
+      # sequence_length: 10
   hmm: # 如果 method 是 hmm，保留 HMM 参数
     # n_states: 10
     observation_features: ["wind", "flow"] # 对于观测 SOM/BMU 仍然需要
     smoothing_epsilon: 1.0e-7
     # --- 新增：添加 HMM 输入类型标志 ---
     input_type: bmu_rank 
-  ghmm:
-    model_type: gaussian   # <--- 新增或修改：指定模型类型 ('categorical' or 'gaussian')
-    n_components: 15      # <--- GaussianHMM 的隐状态数量
-    covariance_type: diag # <--- GaussianHMM 的协方差类型 ('spherical', 'diag', 'full', 'tied')
-    n_iter: 100           # <--- GaussianHMM 训练迭代次数
-    tol: 0.001            # <--- GaussianHMM 收敛阈值
-    # random_state: ${training.random_seed} # 可以沿用全局种子
-    smoothing_epsilon: 1e-7 # 对于 CategoricalHMM 可能需要，GaussianHMM 可能不需要
-    observation_features: [salinity] # 对于 GaussianHMM，这可能指代低维向量本身，不再是独立的观测SOM
-    # input_type: continuous # 可以明确指定，或者根据 model_type 推断
+
 device:
   use_gpu: true
   cuda_device: "cuda:0"

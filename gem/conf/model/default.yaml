@@ -1,0 +1,50 @@
+# conf/model/default.yaml
+# --- 选择降维方法 ---
+dimensionality_reduction:
+  target_feature: "wind" # 目标特征
+  method: pca # 可选项: som, pca, autoencoder
+  som: # 如果 method 是 som，保留 SOM 特定参数
+    # map_size 现在在 training 配置中
+    learning_rate: 0.1
+    neighborhood_size: null
+    # seed: 42
+    training:
+      save_frequency: 10
+      early_stopping: true
+      patience: 5
+  pca: # 添加 PCA 特定参数
+     n_components: 20 # 示例值
+  autoencoder: # 添加 Autoencoder 特定参数
+     encoding_dim: 15 # 示例值
+     hidden_layers: [64, 32] # 示例值
+     activation: 'relu'
+     dropout_rate: 0.1
+     batch_size: 64
+
+# --- 选择预测方法 ---
+prediction:
+  method: lstm # 可选项: hmm, lstm
+  lstm: # 如果 method 是 lstm，保留 LSTM 参数
+      input_type: continuous # 也可以是continuous_vector、 continuous、 bmu_rank
+      hidden_size: 64
+      num_layers: 2
+      dropout: 0.1
+      sequence_length: 10 # 输入 LSTM 的序列长度
+      batch_size: 32
+      epochs: 100
+      lr: 0.001
+      embedding_dim: 32 # 如果添加了 Embedding 层
+      patience: 10 # 提前停止的耐心值
+      use_observation_features: true   # 控制开关
+      observation_features: ['flow', 'wind'] # 指定哪些是观测特征 (如果 use_observation_features=true)
+
+  hmm: # 如果 method 是 hmm，保留 HMM 参数
+    # n_states: 10
+    observation_features: ["wind", "flow"] # 对于观测 SOM/BMU 仍然需要
+    smoothing_epsilon: 1.0e-7
+    # --- 新增：添加 HMM 输入类型标志 ---
+    input_type: bmu_rank 
+
+device:
+  use_gpu: true
+  cuda_device: "cuda:0"

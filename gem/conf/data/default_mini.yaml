@@ -1,0 +1,30 @@
+# conf/data/default_mini.yaml
+
+# --- 定义处理后的数据位置 ---
+# 移除下面的定义，因为它们移到了 paths/default.yaml
+# distance_vectors_dir: ${paths.processed_data_dir}/distance_vectors
+# bmu_indices_dir: ${paths.processed_data_dir}/BMU
+
+salt:
+  data: ${paths.raw_data_dir}/salt_grid.npy
+  lonlat: ${paths.raw_data_dir}/salt_lonlat_grid.npy
+  mask: ${paths.raw_data_dir}/mask.npy
+mesh:
+  vertices: ${paths.raw_data_dir}/vertices.npy
+  triangles: ${paths.raw_data_dir}/triangles.npy
+
+wind:
+  data: ${paths.raw_data_dir}/wind.npy
+  lonlat: ${paths.raw_data_dir}/wind_lonlat.npy
+flow: ${paths.raw_data_dir}/flow.npy
+
+# --- 定义特征加载模式 ---
+feature_loading:
+  bmu_index:
+    # 保持引用不变，现在可以正确找到 paths.bmu_indices_dir
+    file_pattern: "${paths.bmu_indices_dir}/{field}/bmu_indices_{split}.npy"
+  distance_vector:
+    # 保持引用不变，现在可以正确找到 paths.distance_vectors_dir
+    file_pattern: "${paths.distance_vectors_dir}/{field}/{split}_distance_vectors.npy"
+
+coords_filename: "salt_lonlat_grid.npy"

@@ -36,6 +36,7 @@ from src.utils.data_loader import load_raw_data, load_mask, load_scaler, load_sp
 from src.training.train_som import train_single_feature_som, train_combined_feature_som
 from src.training.train_hmm import main as train_hmm_main
 from src.training.train_lstm import train_and_predict_lstm
+from src.training.train_lstm_pca import train_and_predict_lstm_pca
 from src.training.train_pca import train_and_transform_pca
 from src.training.train_autoencoder import train_and_transform_ae
 from src.reconstruction.reconstruct_bmu import reconstruct_from_bmu # 用于基于 SOM 的重建
@@ -43,6 +44,7 @@ from src.reconstruction.reconstruct_bmu import reconstruct_from_bmu # 用于基�
 logger = logging.getLogger(__name__)
 
 def set_global_seeds(seed):
+    """设置全局随机种子以确保结果可重现。"""
     if seed is None:
         logger.warning("未提供随机种子，结果可能不可重现")
         return 
@@ -59,8 +61,6 @@ def set_global_seeds(seed):
         logger.info("已设置CUDA随机种子")
 
     logger.info("全局随机种子设置完成")
-
-# === Pipeline 各阶段的辅助函数 ===
 
 def run_dimensionality_reduction(cfg: DictConfig) -> Dict[str, Any]:
     """运行所选的降维方法。"""
@@ -289,6 +289,7 @@ def run_dimensionality_reduction(cfg: DictConfig) -> Dict[str, Any]:
     return results
 
 def run_prediction(cfg: DictConfig, dr_results: Dict[str, Any]) -> Dict[str, Any]:
+
     """运行所选的预测方法。"""
     config = DrprConfig.from_hydra_config(cfg)
     method = cfg.model.prediction.method
@@ -317,7 +318,7 @@ def run_prediction(cfg: DictConfig, dr_results: Dict[str, Any]) -> Dict[str, Any
     os.makedirs(pred_model_dir, exist_ok=True)
     pred_output_dir = os.path.join(config.paths.predictions_base_dir, f"{dr_results['method']}_{method}") # 例如 predictions/som_hmm
     os.makedirs(pred_output_dir, exist_ok=True)
-
+    
     if method == 'hmm':
         dr_method = dr_results['method']
         hmm_input_type = cfg.model.prediction.hmm.get('input_type', 'bmu_rank')
@@ -356,65 +357,91 @@ def run_prediction(cfg: DictConfig, dr_results: Dict[str, Any]) -> Dict[str, Any
              results['success'] = False; return results
 
     elif method == 'lstm':
-        logger.info("使用 LSTM 进行预测...")
+        logger.info("使用 SOM 进行 LSTM 预测...")
+
         # --- 获取 LSTM 特定配置 ---
         lstm_cfg = cfg.model.prediction.lstm
-        lstm_input_type = lstm_cfg.get('input_type', 'bmu_rank') # 默认或从配置读取
+        lstm_input_type = lstm_cfg.get('input_type') # 默认或从配置读取
         target_field_name = dr_results.get('target_feature', 'salinity') # 获取目标特征名，可能需要从 dr_results 更可靠地获取
-
+        prediction_filename_pattern = f"predicted_lstm_target_{target_field_name}_{{split}}.npy" # 预测文件名模式
         # --- 检查输入类型兼容性 ---
         if dr_method == 'som' and lstm_input_type != 'bmu_rank':
             logger.warning(f"降维方法是 SOM，但 LSTM 输入类型配置为 '{lstm_input_type}' 而不是 'bmu_rank'。请检查配置。假设使用 BMU 索引。")
             lstm_input_type = 'bmu_rank' # 强制或报错
-        elif dr_method in ['pca', 'autoencoder'] and lstm_input_type == 'bmu_rank':
-            logger.error(f"降维方法是 {dr_method} (连续)，但 LSTM 输入类型配置为 'bmu_rank'。不兼容。")
-            return results # 返回失败
-        # 可以添加对 'continuous' 或 'dv' 类型的处理逻辑，如果 train_lstm 支持的话
-        elif lstm_input_type not in ['bmu_rank']: # 目前假设只支持 bmu_rank
-             logger.error(f"当前实现的 LSTM 预测仅支持 'bmu_rank' 输入类型，但配置为 '{lstm_input_type}'。")
-             return results
-        
-        # --- 设置 LSTM 保存路径 ---
-        model_save_dir_lstm = pred_model_dir # 模型保存在方法组合目录下
-        # LSTM 通常不需要单独的 scaler 文件，内部处理 embedding
-        # scaler_save_path_lstm = os.path.join(config.paths.processed_data_dir, f"{dr_method}_lstm_input_scaler.pkl") # 可能不需要
-        pred_output_dir_lstm = pred_output_dir # 预测结果保存在方法组合目录下
-        prediction_filename_pattern = f"predicted_lstm_target_{target_field_name}_{{split}}.npy" # 预测文件名模式
+            
+        if dr_method == 'som' and lstm_input_type == 'bmu_rank':
+            logger.info("调用 LSTM (BMU 版本)...")
+            try:
+                pred_results = train_and_predict_lstm( # 调用 SOM BMU 版本
+                    cfg=cfg,
+                    low_dim_data_paths=low_dim_data_paths, # BMU 路径
+                    model_save_dir=pred_model_dir,
+                    prediction_save_dir=pred_output_dir,
+                    prediction_filename_pattern=prediction_filename_pattern # 适用于 BMU 的模式
+                )
+                # --- 处理 BMU 版本 LSTM 的返回结果 ---
+                if pred_results and 'predicted_target_low_dim_paths' in pred_results:
+                    results['predicted_low_dim_paths'] = pred_results['predicted_target_low_dim_paths']
+                    results['model_path'] = pred_results.get('model_path')
+                    results['success'] = True
+                    logger.info(f"LSTM (BMU) 预测成功...")
+                else:
+                    logger.error("train_and_predict_lstm (BMU) 未返回预期结果。")
+                    # success 保持 False
+            except Exception as e:
+                logger.error(f"调用 train_and_predict_lstm (BMU) 时出错: {e}", exc_info=True)
+                # success 保持 False
 
-        # --- 调用 LSTM 训练和预测函数 ---
-        # 注意：train_and_predict_lstm 需要 low_dim_data_paths 的结构是 {feature: {split: {'positions': path}}}
-        # dr_results['low_dim_data_paths'] 的结构需要与此匹配。
-        # pipeline_new.py 中的 run_dimensionality_reduction (SOM部分) 应该已经生成了这种结构。
-        logger.info(f"传递给 LSTM 的低维数据路径结构: {low_dim_data_paths}") # 打印检查
+        elif dr_method == 'pca' or lstm_input_type == 'continuous':
+            logger.info("调用 LSTM (PCA 版本)...")
+            # --- 获取 PCA 结果中的信息 ---
+            target_feature = dr_results.get('target_feature') # 获取降维的目标特征名
+            pca_n_components = dr_results.get('n_components')
+            if not target_feature or pca_n_components is None:
+                logger.error("dr_results 中缺少 target_feature 或 n_components 信息，无法调用 LSTM (PCA)。")
+                return results # success is False
+            pca_components_info = {target_feature: pca_n_components}
 
+            # --- >>> 关键：重构 low_dim_data_paths 结构 <<< ---
+            # 原始 low_dim_data_paths (来自 dr_results): {'train': path, 'val': path, 'test': path}
+            original_pca_paths = low_dim_data_paths
+            if not isinstance(original_pca_paths, dict) or not all(s in original_pca_paths for s in ['train', 'val', 'test']):
+                 logger.error(f"从 PCA 降维步骤获取的 low_dim_data_paths 结构不正确或不完整: {original_pca_paths}")
+                 return results # success is False
 
-        try:
-            pred_results = train_and_predict_lstm(
-                cfg=cfg,
-                low_dim_data_paths=low_dim_data_paths, # 包含目标和（可选）观测特征的 BMU 路径
-                # target_field_name 和 input_feature_info 现在由 train_lstm 内部推断或从cfg读取
-                model_save_dir=model_save_dir_lstm,
-                prediction_save_dir=pred_output_dir_lstm,
-                prediction_filename_pattern=prediction_filename_pattern
-            )
-        except Exception as e:
-             logger.error(f"调用 train_and_predict_lstm 时发生错误: {e}", exc_info=True)
+            # 期望的结构: {target_feature: {'train': path, 'val': path, 'test': path}}
+            structured_pca_paths = {target_feature: original_pca_paths}
+            logger.info(f"为 LSTM (PCA) 重构 low_dim_data_paths 结构: {structured_pca_paths}")
+            # --- >>> 修改结束 <<< ---
 
-        # --- 处理 LSTM 返回结果 ---
-        if pred_results:
-            # 关键：将预测的 *目标* 低维路径存储到通用键中
-            if 'predicted_target_low_dim_paths' in pred_results:
-                results['predicted_low_dim_paths'] = pred_results['predicted_target_low_dim_paths']
-                results['model_path'] = pred_results.get('model_path') # 保存 LSTM 模型路径
-                results['success'] = True # 标记成功
-                logger.info(f"LSTM 预测成功，预测的目标路径: {results['predicted_low_dim_paths']}")
-            else:
-                logger.error("train_and_predict_lstm 未返回 'predicted_target_low_dim_paths'。")
+            pca_prediction_filename_pattern = f"predicted_target_pca_lstm_{target_field_name}_{{split}}.npy" # target_field_name 之前已定义
+
+            try:
+                pred_results = train_and_predict_lstm_pca( # 调用 PCA 版本
+                    cfg=cfg,
+                    low_dim_data_paths=structured_pca_paths, # <-- 传递修正后的结构
+                    pca_components_info=pca_components_info,
+                    model_save_dir=model_save_dir_lstm,
+                    prediction_save_dir=pred_output_dir_lstm,
+                    prediction_filename_pattern=pca_prediction_filename_pattern
+                )
+                # --- 处理 PCA 版本 LSTM 的返回结果 ---
+                if pred_results and 'predicted_target_low_dim_paths' in pred_results:
+                    results['predicted_low_dim_paths'] = pred_results['predicted_target_low_dim_paths']
+                    results['model_path'] = pred_results.get('model_path')
+                    results['success'] = True
+                    logger.info(f"LSTM (PCA) 预测成功...")
+                else:
+                    logger.error("train_and_predict_lstm_pca 未返回预期结果。")
+                    # success 保持 False
+            except Exception as e:
+                logger.error(f"调用 train_and_predict_lstm_pca 时出错: {e}", exc_info=True)
+                # success 保持 False
+
         else:
-            logger.error("train_and_predict_lstm 调用失败或未返回结果。")
-
-    else:
-        logger.error(f"未知的预测方法: {method}")
+            # 处理其他不兼容或未实现的组合
+            logger.error(f"不支持的降维方法 '{dr_method}' 与 LSTM 输入类型 '{lstm_input_type}' 的组合。")
+            # success 保持 False
 
     # --- 最终检查和日志 ---
     if not results.get('success'): # <--- 因为 'success' 键不存在或不是 True，这里会执行
