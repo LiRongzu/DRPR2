@@ -2,7 +2,7 @@
 # --- 选择降维方法 ---
 dimensionality_reduction:
   target_feature: "salinity" # 目标特征
-  method: pca # 可选项: som, pca, autoencoder
+  method: som # 可选项: som, pca, autoencoder
   som: # 如果 method 是 som，保留 SOM 特定参数
     # map_size 现在在 training 配置中
     learning_rate: 0.1
@@ -24,7 +24,7 @@ dimensionality_reduction:
 
 # --- 选择预测方法 ---
 prediction:
-  method: lstm # 可选项: hmm, lstm
+  method: hmm # 可选项: hmm, lstm
   lstm: # 如果 method 是 lstm，保留 LSTM 参数
       input_type: bmu_rank # 也可以是continuous_vector、 continuous、 bmu_rank
       hidden_size: 64
@@ -41,9 +41,9 @@ prediction:
 
   lstm_pca:
       # List of features whose PCA components are used as LSTM input
-      input_features: ["wind", "salinity"] # Example: use both wind and salinity PCA components
+      # input_features: ["wind", "salinity"] # Example: use both wind and salinity PCA components
       # input_features: ["wind"]           # Example: use only wind PCA components
-      # input_features: ["salinity"]       # Example: use only salinity PCA components
+      input_features: ["salinity"]       # Example: use only salinity PCA components
 
       # Feature whose PCA components the LSTM should predict
       target_feature: "salinity"
