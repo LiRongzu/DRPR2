@@ -56,3 +56,42 @@ def create_sequences(X: np.ndarray, y: np.ndarray, sequence_length: int) -> Tupl
 
     logger.info(f"创建的序列: X_seq 形状 {X_seq_np.shape}, y_seq 形状 {y_seq_np.shape}")
     return X_seq_np, y_seq_np
+
+def create_sequences_ae(data: np.ndarray, seq_length: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    将单一时间序列数据转换为适用于 LSTM 的输入序列 (X) 和目标序列 (y)。
+
+    参数:
+    data (numpy.ndarray): 输入的时间序列数据，形状为 (时间步数, 特征数)。
+    seq_length (int): 每个输入序列的长度。
+
+    返回:
+    tuple: 包含输入序列 (X) 和目标序列 (y) 的元组。
+           X 的形状为 (样本数, seq_length, 特征数)。
+           y 的形状为 (样本数, 特征数)。(如果输入 data 是一维，则 y 形状为 (样本数,))
+    """
+    xs = []
+    ys = []
+    num_samples_possible = len(data) - seq_length
+
+    if num_samples_possible < 1:
+        logging.warning(f"数据长度 ({len(data)}) 对于序列长度 ({seq_length}) 不足。无法创建序列。")
+        # 返回正确维度的空数组
+        num_features = data.shape[1] if data.ndim > 1 else 1
+        return np.empty((0, seq_length, num_features)), np.empty((0, num_features)) # y 保持特征维度
+
+    for i in range(num_samples_possible):
+        x = data[i:(i + seq_length)]
+        y = data[i + seq_length] # 目标是紧接着序列的下一个时间步的数据点
+        xs.append(x)
+        ys.append(y)
+
+    X_seq_np = np.array(xs)
+    y_seq_np = np.array(ys)
+
+    # 确保 y_seq_np 至少是二维的 (N, Features)，即使只有一个特征
+    if y_seq_np.ndim == 1 and data.ndim == 2:
+        y_seq_np = y_seq_np.reshape(-1, data.shape[1])
+
+    logging.info(f"创建的序列: X_seq 形状 {X_seq_np.shape}, y_seq 形状 {y_seq_np.shape}")
+    return X_seq_np, y_seq_np
