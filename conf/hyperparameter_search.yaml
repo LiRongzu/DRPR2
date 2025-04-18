@@ -1,0 +1,76 @@
+defaults:
+  - _self_
+  - model: default
+  - data: default
+  - paths: default
+  - evaluation: default
+  - visualization: default
+
+# 超参数搜索设置
+hyperparameter_search:
+  study_name: "ae_lstm_优化"
+  n_trials: 50
+  n_jobs: 1   # 可以增加以进行并行优化
+  direction: "minimize"  # 优化目标是最小化RMSE
+  db_storage: "sqlite:///optuna_studies.db"  # 持久化存储
+  run_best_config: true  # 用最佳配置重新运行一次pipeline
+  
+  # 提前停止设置
+  pruner:
+    type: "percentile"  # 或 "median"
+    percentile: 25      # 仅用于percentile修剪器
+    n_startup_trials: 5 # 在开始修剪前需要完成的试验数量
+
+  # 参数映射
+  pipeline:
+    param_mapping:
+      ae_encoding_dim: "model.dimensionality_reduction.autoencoder.encoding_dim"
+      ae_hidden_layer1: "model.dimensionality_reduction.autoencoder.hidden_layers.0"
+      ae_hidden_layer2: "model.dimensionality_reduction.autoencoder.hidden_layers.1"
+      ae_dropout: "model.dimensionality_reduction.autoencoder.dropout_rate"
+      ae_learning_rate: "model.dimensionality_reduction.autoencoder.learning_rate"
+      ae_batch_size: "model.dimensionality_reduction.autoencoder.batch_size"
+      ae_epochs: "model.dimensionality_reduction.autoencoder.epochs"
+      ae_activation: "model.dimensionality_reduction.autoencoder.activation"
+      lstm_hidden_size: "model.prediction.lstm_ae.hidden_size"
+      lstm_num_layers: "model.prediction.lstm_ae.num_layers"
+      lstm_dropout: "model.prediction.lstm_ae.dropout"
+      lstm_sequence_length: "model.prediction.lstm_ae.sequence_length"
+      lstm_learning_rate: "model.prediction.lstm_ae.learning_rate"
+      lstm_batch_size: "model.prediction.lstm_ae.batch_size"
+      lstm_patience: "model.prediction.lstm_ae.patience"
+      use_wind: "model.prediction.input_sources.use_wind"
+      use_flow: "model.prediction.input_sources.use_flow"
+
+  # 各组件的搜索空间
+  search_spaces:
+    ae:
+      # 使用对数尺度搜索编码维度
+      encoding_dim: [10, 15, 20, 30]
+      hidden_layers:
+        - [64, 128, 256]  # 简化选项
+        - [32, 64, 128]
+      dropout_rate: [0.0, 0.1, 0.2, 0.3, 0.5]
+      learning_rate: [0.001, 0.0005, 0.0001]
+      batch_size: [16, 32, 64, 128]
+      epochs: [50, 100, 150, 200]
+      activation: ["ReLU", "LeakyReLU", "Tanh"] #LeakyReLU
+      weight_decay: [0.0, 0.00001, 0.0001, 0.001]  # L2正则化参数
+    
+    lstm:
+      hidden_size: [32, 64, 128, 256]
+      num_layers: [1, 2, 3]
+      dropout: [0.0, 0.1, 0.2, 0.3, 0.5]
+      sequence_length: [5, 10, 15, 20]
+      learning_rate: [0.001, 0.0005, 0.0001]
+      batch_size: [16, 32, 64, 128]
+      patience: [10, 20, 30, 50, 100]
+    
+    input_sources:
+      use_wind: [true, false]
+      use_flow: [true, false]
+
+  # 优化分析
+  analysis:
+    plots_enabled: true
+    export_csv: true

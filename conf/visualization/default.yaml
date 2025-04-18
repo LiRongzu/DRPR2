@@ -5,6 +5,7 @@ output_format: "png"  # 输出图像格式
 dpi: 300             # 图像分辨率
 save_figures: true   # 是否保存图像
 show_figures: false  # 是否显示图像
+enabled: True
 
 map:
 

@@ -28,3 +28,22 @@ feature_loading:
     file_pattern: "${paths.distance_vectors_dir}/{field}/{split}_distance_vectors.npy"
 
 coords_filename: "salt_lonlat_grid.npy"
+
+# --- 原始数据维度 (保持) ---
+salinity_dim: 5000 # 示例
+wind_dim: 2000     # 示例: 原始风场维度 (可能仍有用)
+
+# --- 预计算的 PCA 风场维度 (重要) ---
+# 修改: 设置为你预计算的 PCA 组件数量
+wind_pca_dim: 15 # 例如: 16 或你实际使用的组件数
+
+# --- 数据分割名称 (保持) ---
+splits: ['train', 'val', 'test']
+
+# --- 指向 paths 配置的引用 (更新) ---
+processed_data:
+  salinity: ${paths.processed_paths.salinity}
+  wind_pca: ${paths.processed_paths.wind_pca} # 指向预计算的 PCA 低维数据
+scalers: ${paths.scaler_paths}
+pretrained_models:
+  wind_pca: ${paths.pretrained_pca_model_path} # 添加 PCA 模型路径引用

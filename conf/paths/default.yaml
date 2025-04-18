@@ -31,7 +31,7 @@ predicted_states_standard_file: ${paths.predicted_states_dir}/predicted_salinity
 project_root_dir: ${oc.env:PROJECT_ROOT,${hydra:runtime.cwd}}
 raw_data_dir: ${paths.project_root_dir}/data/raw/mini
 processed_data_dir: ${paths.project_root_dir}/data/processed/mini
-
+mask_path: ${paths.raw_data_dir}/mask.npy
 # --- 添加以下定义 ---
 # 定义 BMU 和 DV 输入数据的目录 (相对于 processed_data_dir)
 bmu_indices_dir: ${paths.processed_data_dir}/BMU
@@ -40,3 +40,73 @@ distance_vectors_dir: ${paths.processed_data_dir}/distance_vectors
 
 # Directory for predicted low-dimensional sequences (e.g., LSTM output)
 predicted_low_dim_dir: ${hydra:run.dir}/predicted_low_dim
+
+# forAE————————————————————————————————————————————————————————————————————————————————————————————
+
+data_root_dir: ${oc.env:PROJECT_ROOT,${hydra:runtime.cwd}} # 或者使用相对路径 "data"
+# processed_data_dir: "${paths.project_root_dir}/data/processed/mini"
+pca_model_dir: "${paths.data_root_dir}/data/pca/model" # PCA 模型目录
+
+# --- Hydra 运行时输出目录 (保持不变) ---
+output_dir: ${hydra:runtime.output_dir}
+
+# --- output_dir 内的子目录 (保持不变) ---
+models_subdir: "models"
+scalers_subdir: "scalers"
+data_subdir: "data"
+results_subdir: "results"
+plots_subdir: "plots"
+
+# === 本次运行生成的产物的路径 (全部在 output_dir 下) ===
+# (这部分保持不变，所有实验产物仍在运行目录下)
+# Salinity AE 相关路径
+ae_model_path: "${paths.output_dir}/${paths.models_subdir}/ae_salinity_model.pth"
+latent_salinity_paths:
+  train: "${paths.output_dir}/${paths.data_subdir}/latent_salinity_train.npy"
+  val: "${paths.output_dir}/${paths.data_subdir}/latent_salinity_val.npy"
+  test: "${paths.output_dir}/${paths.data_subdir}/latent_salinity_test.npy"
+# Wind Processing - 不再有运行时生成的模型或数据路径
+
+# LSTM 相关路径
+lstm_model_path: "${paths.output_dir}/${paths.models_subdir}/lstm_ae_wind_model.pth"
+# *运行时* 拟合的 Scaler
+lstm_input_scaler_path: "${paths.output_dir}/${paths.scalers_subdir}/lstm_input_scaler.pkl"
+latent_salinity_target_scaler_path: "${paths.output_dir}/${paths.scalers_subdir}/latent_salinity_target_scaler.pkl"
+# LSTM 预测结果
+predicted_latent_salinity_paths:
+  train: "${paths.output_dir}/${paths.data_subdir}/predicted_latent_salinity_train.npy"
+  val: "${paths.output_dir}/${paths.data_subdir}/predicted_latent_salinity_val.npy"
+  test: "${paths.output_dir}/${paths.data_subdir}/predicted_latent_salinity_test.npy"
+
+# 重建相关路径
+reconstructed_salinity_paths:
+  train: "${paths.output_dir}/${paths.data_subdir}/reconstructed_salinity_train.npy"
+  val: "${paths.output_dir}/${paths.data_subdir}/reconstructed_salinity_val.npy"
+  test: "${paths.output_dir}/${paths.data_subdir}/reconstructed_salinity_test.npy"
+
+# 评估相关路径
+evaluation_metrics_path: "${paths.output_dir}/${paths.results_subdir}/evaluation_metrics.yaml"
+evaluation_plot_timeseries_path: "${paths.output_dir}/${paths.plots_subdir}/timeseries_comp_feature_{feature_idx}.png"
+evaluation_plot_spatial_path: "${paths.output_dir}/${paths.plots_subdir}/spatial_comp_sample_{sample_idx}.png"
+
+# === 预处理/预计算文件的路径 (指向中心目录) ===
+processed_paths:
+  salinity: # 预处理的盐度数据
+    train: "${paths.processed_data_dir}/train_salinity_processed.npy"
+    val: "${paths.processed_data_dir}/val_salinity_processed.npy"
+    test: "${paths.processed_data_dir}/test_salinity_processed.npy"
+  wind_pca: # 预计算的 PCA 低维风场数据
+    train: "${paths.project_root_dir}/data/pca/components/pca_components_wind_train.npy"
+    val: "${paths.project_root_dir}/data/pca/components/pca_components_wind_val.npy"
+    test: "${paths.project_root_dir}/data/pca/components/pca_components_wind_test.npy"
+  flow: # 预处理的流量数据
+    train: "${paths.processed_data_dir}/train_flow_processed.npy"
+    val: "${paths.processed_data_dir}/val_flow_processed.npy"
+    test: "${paths.processed_data_dir}/test_flow_processed.npy"
+# 预计算的 Scaler 路径
+scaler_paths: 
+  salinity: "${paths.processed_data_dir}/salinity_scaler.npy"
+  wind: "${paths.processed_data_dir}/wind_scaler.npy" # 原始风场数据的 Scaler (可能仍需加载以了解原始范围，但不再用于变换)
+  flow: "${paths.processed_data_dir}/flow_scaler.npy" # 流量数据的 Scaler
+# 预计算的 PCA 模型路径
+pretrained_pca_model_path: "${paths.pca_model_dir}/pca_model_wind.pkl"
