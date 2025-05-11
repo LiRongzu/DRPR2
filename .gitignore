@@ -36,6 +36,9 @@ exp/params/*
 outputs/*
 srcc/*
 srrcc/*
+AE_LSTM/*
+ae_lstm_subproject/*
+
 # Hydra outputs
 outputs/
 multirun/
