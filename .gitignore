@@ -39,6 +39,8 @@ srrcc/*
 # Hydra outputs
 outputs/
 multirun/
+AE_LSTM/
+ae_lstm_subproject/
 
 # Logs
 *.log
