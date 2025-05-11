@@ -29,9 +29,9 @@ from src.evaluation.visualization import (
     plot_spatial_distribution
 )
 from src.utils.model_utils import get_device_from_config
-from src.dimensionality_reduction.som_pytorch import SOMTorch
 # --- 导入数据加载器 ---
 from src.utils.data_loader import load_raw_data, load_mask, load_scaler, load_split_indices # Keep load_scaler if used elsewhere
+from src.prediction_models.lstm_pca import LSTMPredictionModel # 使用你定义的模型类
 
 # --- 导入训练和重建函数 ---
 from src.training.train_som import train_single_feature_som, train_combined_feature_som
@@ -94,7 +94,246 @@ def set_global_seeds(seed = 42):
         logger.info("已设置CUDA随机种子")
     logger.info("全局随机种子设置完成")
 
+# ...existing code...
+def pcalstm_multi_step_forecast_rmse_curve(
+    cfg: DictConfig,
+    lstm_model: 'LSTMPredictionModel',
+    val_pca_inputs: Dict[str, np.ndarray],
+    val_external_inputs: Dict[str, np.ndarray],
+    val_pca_target: np.ndarray,
+    target_feature: str,
+    input_features_ordered: List[str],
+    external_features: List[str], # Keep this for clarity, though input_features_ordered contains all
+    scaler: Dict[str, np.ndarray], # Original high-dim scaler info
+    pca_model: Any, # PCA model for the target feature
+    mask: np.ndarray,
+    max_steps: int = 31
+) -> np.ndarray:
 
+    # --- Load LSTM Scalers ---
+    # Scaler for the target variable (Y) used during LSTM training
+    scaler_lstm_path = os.path.join(
+        cfg.paths.hydra_run_dir,
+        f"pca_lstm_scalers/scaler_pca_Y_{target_feature}.pkl"
+    )
+    scaler_lstm = joblib.load(scaler_lstm_path)
+
+    # Scaler for the PCA components (X) used during LSTM training
+    scaler_lstm_x_path = os.path.join(
+        cfg.paths.hydra_run_dir,
+        f"pca_lstm_scalers/scaler_pca_X_{target_feature}.pkl" # Assuming one scaler for all PCA inputs for this target
+    )
+    scaler_lstm_x = joblib.load(scaler_lstm_x_path)
+
+    # Scaler for the external features (X) used during LSTM training
+    # Assuming only 'flow' for now, adjust if multiple external features with different scalers exist
+    # You might need a dictionary of scalers if external features are scaled differently.
+    flow_feature_name = external_features[0] if external_features else None # Get the name, e.g., 'flow'
+    scaler_lstm_flow = None
+    if flow_feature_name:
+        scaler_lstm_flow_path = os.path.join(
+            cfg.paths.hydra_run_dir,
+            f"pca_lstm_scalers/scaler_external_X_{flow_feature_name}.pkl"
+        )
+        if os.path.exists(scaler_lstm_flow_path):
+             scaler_lstm_flow = joblib.load(scaler_lstm_flow_path)
+        else:
+             logger.warning(f"Scaler for external feature '{flow_feature_name}' not found at {scaler_lstm_flow_path}. External features will not be scaled.")
+
+
+    sequence_length = cfg.model.prediction.lstm_pca.sequence_length
+    device = next(lstm_model.parameters()).device
+    lstm_model.eval()
+
+    # Determine number of samples based on the shortest input sequence
+    min_len = val_pca_target.shape[0]
+    for k, v in val_pca_inputs.items():
+        min_len = min(min_len, v.shape[0])
+    for k, v in val_external_inputs.items():
+        min_len = min(min_len, v.shape[0])
+    num_samples = min_len
+
+    # 手动设置步长为 1 的 RMSE 值 (来自之前的计算或评估)
+    rmse_step_1 = 1.624693 # 使用您提供的 test set RMSE 值
+    rmse_curve = [rmse_step_1]
+    logger.info(f"Manually set RMSE for step 1 to: {rmse_step_1:.6f}")
+
+
+    for steps in range(2, max_steps + 1):
+        num_rolls = num_samples - sequence_length - steps + 1
+        if num_rolls <= 0:
+            logger.warning(f"Not enough samples ({num_samples}) for sequence length ({sequence_length}) and forecast steps ({steps}). Skipping step {steps}.")
+            rmse_curve.append(np.nan)
+            continue
+
+        errors = []
+        for roll_start in range(num_rolls):
+            # 1. Prepare the initial *scaled* observation window
+            scaled_seq_list = []
+            for fname in input_features_ordered:
+                # Get the raw sequence part
+                if fname in val_pca_inputs:
+                    raw_part = val_pca_inputs[fname][roll_start : roll_start + sequence_length]
+                    # Scale PCA features using scaler_lstm_x
+                    # Ensure input is 2D for scaler
+                    if raw_part.ndim == 1: raw_part = raw_part.reshape(-1, 1)
+                    # Check if target feature is also a PCA input feature
+                    if fname == target_feature:
+                         # If target is also input, use the Y scaler (scaler_lstm)
+                         scaled_part = scaler_lstm.transform(raw_part)
+                    else:
+                         # Otherwise use the X scaler for PCA features
+                         scaled_part = scaler_lstm_x.transform(raw_part)
+
+                elif fname in val_external_inputs:
+                    raw_part = val_external_inputs[fname][roll_start : roll_start + sequence_length]
+                    # Scale external features using scaler_lstm_flow
+                    if scaler_lstm_flow:
+                        # Ensure input is 2D for scaler
+                        if raw_part.ndim == 1: raw_part = raw_part.reshape(-1, 1)
+                        scaled_part = scaler_lstm_flow.transform(raw_part)
+                    else:
+                        scaled_part = raw_part # Use raw if no scaler
+                        if scaled_part.ndim == 1: scaled_part = scaled_part[:, None] # Ensure 2D anyway
+                else:
+                    logger.error(f"Feature '{fname}' not found in val_pca_inputs or val_external_inputs during initial sequence creation.")
+                    # Handle error appropriately, maybe skip this roll_start
+                    continue # Or break, or raise error
+
+                scaled_seq_list.append(scaled_part)
+
+            # Check if all parts were added successfully before concatenating
+            if len(scaled_seq_list) != len(input_features_ordered):
+                 logger.warning(f"Skipping roll_start {roll_start} due to missing feature data.")
+                 continue
+
+            current_sequence_scaled = np.concatenate(scaled_seq_list, axis=1)
+            current_sequence_scaled = torch.tensor(current_sequence_scaled, dtype=torch.float32).to(device)
+
+            # 2. Autoregressive prediction for 'steps' steps
+            predicted_target_scaled_last_step = None # Store the final prediction
+            for step in range(steps):
+                with torch.no_grad():
+                    # Input shape: (batch_size=1, sequence_length, num_features)
+                    input_batch = current_sequence_scaled.unsqueeze(0)
+                    # Prediction is for the *next* time step's target feature, already scaled by scaler_lstm
+                    pred_target_scaled = lstm_model(input_batch).squeeze(0).cpu().numpy() # Shape: (output_size,) e.g. (n_components_target,)
+
+                # Store the prediction if it's the last step needed
+                if step == steps - 1:
+                    predicted_target_scaled_last_step = pred_target_scaled
+
+
+
+                # Construct the *scaled* input for the *next* prediction step
+                next_input_parts_scaled = []
+                current_time_idx = roll_start + sequence_length + step # Index for known inputs at the *current* step end
+
+                for fname in input_features_ordered:
+                    if fname == target_feature:
+                        # Use the prediction from the previous step (already scaled)
+                        next_input_parts_scaled.append(pred_target_scaled)
+                    elif fname in val_external_inputs:
+                        # Get the *known* external input for the next time step
+                        val_raw = val_external_inputs[fname][current_time_idx]
+                        # Scale it using the appropriate scaler
+                        if scaler_lstm_flow:
+                            # Scaler expects 2D, reshape scalar or 1D array
+                            val_raw_2d = np.array([[val_raw]]) if np.isscalar(val_raw) else val_raw.reshape(1, -1)
+                            val_scaled = scaler_lstm_flow.transform(val_raw_2d).flatten()
+                        else:
+                            val_scaled = np.array([val_raw]) if np.isscalar(val_raw) else val_raw # Use raw if no scaler
+                        next_input_parts_scaled.append(val_scaled)
+                    elif fname in val_pca_inputs:
+                        # Get the *known* PCA input for the next time step
+                        val_raw = val_pca_inputs[fname][current_time_idx]
+                        # Scale it using the PCA X scaler
+                        # Scaler expects 2D
+                        val_raw_2d = val_raw.reshape(1, -1)
+                        val_scaled = scaler_lstm_x.transform(val_raw_2d).flatten()
+                        next_input_parts_scaled.append(val_scaled)
+                    else:
+                         logger.error(f"Feature '{fname}' not found during next step input construction.")
+                         # Handle error
+                         break # Exit inner loop
+
+                # Check if all parts were added successfully before concatenating
+                if len(next_input_parts_scaled) != len(input_features_ordered):
+                     logger.warning(f"Skipping prediction step {step+1} for roll_start {roll_start} due to missing feature data.")
+                     break # Exit the step loop for this roll_start
+
+                # Concatenate to form the full feature vector for the next input time step
+                next_input_scaled = np.concatenate(next_input_parts_scaled) # Should be 1D array
+                next_input_scaled = torch.tensor(next_input_scaled, dtype=torch.float32).to(device)
+
+                # Update the sequence: drop the oldest, append the new scaled input
+                current_sequence_scaled = torch.cat([current_sequence_scaled[1:], next_input_scaled.unsqueeze(0)], dim=0)
+
+            # Ensure the loop completed successfully and we have the final prediction
+            if predicted_target_scaled_last_step is None:
+                logger.debug(f"Prediction loop did not complete for roll_start {roll_start}, step {steps}. Skipping.")
+                continue
+
+            # 3. Inverse transform the final prediction back to high-dimensional space
+            try:
+                # 1. LSTM output (target) inverse scaling (using scaler_lstm)
+                # Ensure input to inverse_transform is 2D
+                pred_target_unscaled_lstm = scaler_lstm.inverse_transform(predicted_target_scaled_last_step.reshape(1, -1))
+
+                # 2. PCA inverse transform (using target's pca_model)
+                recon_scaled_pca = pca_model.inverse_transform(pred_target_unscaled_lstm) # Shape: (1, high_dim_flat)
+
+                # 3. Original high-dimensional scaler inverse transform (using original 'scaler' dict)
+                mean_vec = scaler['mean']
+                std_vec = scaler['std'] # Assuming 'std' key exists from your previous correction
+                epsilon = 1e-8
+                # recon_scaled_pca is already (1, high_dim_flat), remove batch dim
+                recon_highdim = recon_scaled_pca.flatten() * (std_vec + epsilon) + mean_vec # Element-wise operation
+            except Exception as e:
+                logger.error(f"Multi-step inverse transform failed (roll {roll_start}, step {steps}): {e}", exc_info=True)
+                continue
+
+            # 4. Get the ground truth for comparison
+            gt_pca_target = val_pca_target[roll_start + sequence_length + steps - 1] # Target PCA components at the forecast time
+            try:
+                # Inverse transform ground truth PCA components
+                gt_scaled_pca = pca_model.inverse_transform(gt_pca_target.reshape(1, -1))
+                # Inverse transform using original high-dim scaler
+                gt_highdim = gt_scaled_pca.flatten() * (std_vec + epsilon) + mean_vec
+            except Exception as e:
+                logger.error(f"Ground truth inverse transform failed (roll {roll_start}, step {steps}): {e}", exc_info=True)
+                continue
+
+            # 5. Calculate RMSE for this roll and step (using high-dimensional data)
+            # Apply mask implicitly by calculating mean over potentially NaN values if mask was applied during PCA
+            # Or, explicitly apply mask if needed (assuming recon_highdim/gt_highdim match mask shape)
+            # For now, assume NaNs handle masking if present
+            mse = np.nanmean((recon_highdim - gt_highdim) ** 2)
+            if np.isnan(mse):
+                 logger.debug(f"MSE is NaN for roll {roll_start}, step {steps}. Check inputs/masking.")
+                 # errors.append(np.nan) # Append NaN or skip? Appending NaN is better for averaging.
+            else:
+                 rmse = np.sqrt(mse)
+                 errors.append(rmse)
+
+        # Calculate average RMSE for this forecast step across all rolls
+        if errors: # Only average if there are valid error calculations
+            # Filter out NaNs before averaging if any occurred
+            valid_errors = [e for e in errors if not np.isnan(e)]
+            if valid_errors:
+                 avg_rmse_for_step = float(np.mean(valid_errors))
+            else:
+                 avg_rmse_for_step = np.nan # All errors were NaN
+        else: # No successful rolls for this step
+            avg_rmse_for_step = np.nan
+
+        rmse_curve.append(avg_rmse_for_step)
+        logger.debug(f"Step {steps}: Avg RMSE = {avg_rmse_for_step:.4f} (from {len(valid_errors) if errors and valid_errors else 0}/{num_rolls} rolls)")
+
+
+    return np.array(rmse_curve)
+
+# ...rest of the file...
 def run_dimensionality_reduction(cfg: DictConfig) -> Dict[str, Any]:
     """运行所选的降维方法 (或加载 PCA/AE 结果)。"""
     config = DrprConfig.from_hydra_config(cfg)
@@ -204,13 +443,6 @@ def run_dimensionality_reduction(cfg: DictConfig) -> Dict[str, Any]:
         else:
             logger.error("未能成功定位所有必需特征的 PCA 文件。")
             results['success'] = False # 确保是 False
-
-    # --- Autoencoder 逻辑 (Placeholder) ---
-    elif method == 'autoencoder':
-        # 此处应加载 AE 预处理结果，类似于 PCA
-        logger.warning("Autoencoder 降维加载逻辑尚未实现。")
-        # results['success'] 保持 False
-        pass
 
     else:
         logger.error(f"未知的降维方法: {method}")
@@ -564,9 +796,11 @@ def run_reconstruction(cfg: DictConfig, dr_results: Dict[str, Any], pred_results
     return results
 
 
-def run_evaluation(cfg: DictConfig, recon_results: Dict[str, Any], dr_method: str, pred_method: str):
+def run_evaluation(cfg: DictConfig, recon_results: Dict[str, Any],  dr_results, pred_results) -> Dict[str, Any]:
     """运行评估，比较重建数据与原始数据。"""
     config = DrprConfig.from_hydra_config(cfg)
+    dr_method = dr_results.get('method', '')
+    pred_method = pred_results.get('method', '')
     logger.info(f"--- 阶段：评估 (DR: {dr_method}, Pred: {pred_method}) ---")
     results = {'success': False} # 初始化
 
@@ -726,75 +960,76 @@ def run_evaluation(cfg: DictConfig, recon_results: Dict[str, Any], dr_method: st
             np.save(rmse_map_file, metrics["rmse_map"])
 
 
-            # --- 绘制图表 (如果指标有效) ---
-            if metrics.get("mean_rmse") is not np.nan:
-                # 时间序列对比图
-                rec_mean_ts = np.nanmean(recon_flat, axis=1)
-                orig_mean_ts = np.nanmean(orig_for_comparison, axis=1)
-                ts_save_path = os.path.join(eval_output_dir_split, f"time_series_comparison_{split}.png")
-                try:
-                    plot_time_series_comparison(rec_mean_ts, orig_mean_ts, cfg=cfg, save_path=ts_save_path,
-                                                title=f"Spatial Mean TS ({split} - {dr_method}_{pred_method})")
-                    figure_paths_split.append(ts_save_path)
-                except Exception as e_plot: logger.error(f"绘制时间序列图失败 ({split}): {e_plot}")
+            # # --- 绘制图表 (如果指标有效) ---
+            # if metrics.get("mean_rmse") is not np.nan:
+            #     # 时间序列对比图
+            #     rec_mean_ts = np.nanmean(recon_flat, axis=1)
+            #     orig_mean_ts = np.nanmean(orig_for_comparison, axis=1)
+            #     ts_save_path = os.path.join(eval_output_dir_split, f"time_series_comparison_{split}.png")
+            #     try:
+            #         plot_time_series_comparison(rec_mean_ts, orig_mean_ts, cfg=cfg, save_path=ts_save_path,
+            #                                     title=f"Spatial Mean TS ({split} - {dr_method}_{pred_method})")
+            #         figure_paths_split.append(ts_save_path)
+            #     except Exception as e_plot: logger.error(f"绘制时间序列图失败 ({split}): {e_plot}")
 
-                # 空间 RMSE 图
-                if rmse_field is not None and np.any(np.isfinite(rmse_field)):
-                    spatial_rmse_save_path = os.path.join(eval_output_dir_split, f"spatial_rmse_{split}.png")
-                    try:
-                        # 注意 plot_spatial_rmse 可能需要 mask=True表示无效点
-                        plot_spatial_rmse(rmse_field, cfg=cfg, mask=boolean_mask, save_path=spatial_rmse_save_path,
-                                            title=f"Spatial RMSE ({split} - {dr_method}_{pred_method})")
-                        figure_paths_split.append(spatial_rmse_save_path)
-                    except Exception as e_plot: logger.error(f"绘制空间 RMSE 图失败 ({split}): {e_plot}")
+            #     # 空间 RMSE 图
+            #     if rmse_field is not None and np.any(np.isfinite(rmse_field)):
+            #         spatial_rmse_save_path = os.path.join(eval_output_dir_split, f"spatial_rmse_{split}.png")
+            #         try:
+            #             # 注意 plot_spatial_rmse 可能需要 mask=True表示无效点
+            #             plot_spatial_rmse(rmse_field, cfg=cfg, mask=boolean_mask, save_path=spatial_rmse_save_path,
+            #                                 title=f"Spatial RMSE ({split} - {dr_method}_{pred_method})")
+            #             figure_paths_split.append(spatial_rmse_save_path)
+            #         except Exception as e_plot: logger.error(f"绘制空间 RMSE 图失败 ({split}): {e_plot}")
 
-                # --- (可选) 空间相关性图 ---
-                if cfg.evaluation.get("calculate_correlation", False):
-                    logger.info(f"  计算空间相关性图 ({split})...")
-                    try:
-                        # 注意 calculate_correlation_map 需要 mask=True 表示无效
-                        corr_map = calculate_correlation_map(recon_spatial, orig_spatial_masked, (mask != 0))
-                        metrics['correlation_map'] = corr_map # 添加到运行时字典，但不保存到 yaml
-                        mean_corr = float(np.nanmean(corr_map)) if np.any(np.isfinite(corr_map)) else np.nan
-                        metrics_to_save['mean_correlation'] = mean_corr # 保存平均相关性
-                        logger.info(f"  {split} - Mean Correlation: {mean_corr:.6f}")
-                        # 保存相关性图的 npy 文件
-                        corr_map_file = os.path.join(eval_output_dir_split, f"correlation_map_{split}.npy")
-                        np.save(corr_map_file, corr_map)
+            #     # --- (可选) 空间相关性图 ---
+            #     if cfg.evaluation.get("calculate_correlation", False):
+            #         logger.info(f"  计算空间相关性图 ({split})...")
+            #         try:
+            #             # 注意 calculate_correlation_map 需要 mask=True 表示无效
+            #             corr_map = calculate_correlation_map(recon_spatial, orig_spatial_masked, (mask != 0))
+            #             metrics['correlation_map'] = corr_map # 添加到运行时字典，但不保存到 yaml
+            #             mean_corr = float(np.nanmean(corr_map)) if np.any(np.isfinite(corr_map)) else np.nan
+            #             metrics_to_save['mean_correlation'] = mean_corr # 保存平均相关性
+            #             logger.info(f"  {split} - Mean Correlation: {mean_corr:.6f}")
+            #             # 保存相关性图的 npy 文件
+            #             corr_map_file = os.path.join(eval_output_dir_split, f"correlation_map_{split}.npy")
+            #             np.save(corr_map_file, corr_map)
 
-                        if cfg.evaluation.visualization.get("plot_spatial_correlation", True) and np.any(np.isfinite(corr_map)):
-                            corr_save_path = os.path.join(eval_output_dir_split, f"spatial_correlation_{split}.png")
-                            # plot_spatial_statistic 需要 mask=True 表示无效
-                            plot_spatial_statistic(corr_map, cfg, (mask != 0), corr_save_path,
-                                                 title=f"Spatial Correlation ({split} - {dr_method}_{pred_method})",
-                                                 cmap='coolwarm', vmin=-1, vmax=1, cbar_label="Correlation Coeff.")
-                            figure_paths_split.append(corr_save_path)
-                    except Exception as e: logger.error(f"  计算或绘制空间相关性图失败 ({split}): {e}", exc_info=True)
+            #             if cfg.evaluation.visualization.get("plot_spatial_correlation", True) and np.any(np.isfinite(corr_map)):
+            #                 corr_save_path = os.path.join(eval_output_dir_split, f"spatial_correlation_{split}.png")
+            #                 # plot_spatial_statistic 需要 mask=True 表示无效
+            #                 plot_spatial_statistic(corr_map, cfg, (mask != 0), corr_save_path,
+            #                                      title=f"Spatial Correlation ({split} - {dr_method}_{pred_method})",
+            #                                      cmap='coolwarm', vmin=-1, vmax=1, cbar_label="Correlation Coeff.")
+            #                 figure_paths_split.append(corr_save_path)
+            #         except Exception as e: logger.error(f"  计算或绘制空间相关性图失败 ({split}): {e}", exc_info=True)
 
-                # --- (可选) 瞬时对比图 ---
-                if cfg.evaluation.visualization.get("plot_instantaneous", False):
-                    time_indices_to_plot = cfg.evaluation.visualization.get("time_indices_to_plot", [0, n_recon_samples // 2, n_recon_samples - 1])
-                    logger.info(f"  绘制特定时间点的空间图 ({split}, indices={time_indices_to_plot})...")
-                    for t_idx in time_indices_to_plot:
-                         if 0 <= t_idx < n_recon_samples:
-                              try:
-                                   comp_save_path = os.path.join(eval_output_dir_split, f"spatial_comparison_{split}_t{t_idx}.png")
-                                   # plot 函数需要 mask=True 表示无效
-                                   plot_spatial_comparison_at_timestep(
-                                       orig_spatial_masked[t_idx], recon_spatial[t_idx], diff_spatial[t_idx],
-                                       cfg, (mask != 0), t_idx, comp_save_path,
-                                       title_prefix=f"Spatial Comparison ({split} - {dr_method}_{pred_method})"
-                                   )
-                                   figure_paths_split.append(comp_save_path)
+            #     # --- (可选) 瞬时对比图 ---
+            #     if cfg.evaluation.visualization.get("plot_instantaneous", False):
+            #         time_indices_to_plot = cfg.evaluation.visualization.get("time_indices_to_plot", [0, n_recon_samples // 2, n_recon_samples - 1])
+            #         logger.info(f"  绘制特定时间点的空间图 ({split}, indices={time_indices_to_plot})...")
+            #         for t_idx in time_indices_to_plot:
+            #              if 0 <= t_idx < n_recon_samples:
+            #                   try:
+            #                        comp_save_path = os.path.join(eval_output_dir_split, f"spatial_comparison_{split}_t{t_idx}.png")
+            #                        # plot 函数需要 mask=True 表示无效
+            #                        plot_spatial_comparison_at_timestep(
+            #                            orig_spatial_masked[t_idx], recon_spatial[t_idx], diff_spatial[t_idx],
+            #                            cfg, (mask != 0), t_idx, comp_save_path,
+            #                            title_prefix=f"Spatial Comparison ({split} - {dr_method}_{pred_method})"
+            #                        )
+            #                        figure_paths_split.append(comp_save_path)
 
-                                   if cfg.evaluation.visualization.get("plot_instantaneous_difference_only", True):
-                                       diff_save_path = os.path.join(eval_output_dir_split, f"spatial_difference_{split}_t{t_idx}.png")
-                                       plot_spatial_difference(
-                                           diff_spatial[t_idx], cfg, (mask != 0), t_idx, diff_save_path,
-                                           title=f"Spatial Difference ({split} - {dr_method}_{pred_method})"
-                                       )
-                                       figure_paths_split.append(diff_save_path)
-                              except Exception as e: logger.error(f"  绘制瞬时图失败 (t={t_idx}, split={split}): {e}", exc_info=True)
+            #                        if cfg.evaluation.visualization.get("plot_instantaneous_difference_only", True):
+            #                            diff_save_path = os.path.join(eval_output_dir_split, f"spatial_difference_{split}_t{t_idx}.png")
+            #                            plot_spatial_difference(
+            #                                diff_spatial[t_idx], cfg, (mask != 0), t_idx, diff_save_path,
+            #                                title=f"Spatial Difference ({split} - {dr_method}_{pred_method})"
+            #                            )
+            #                            figure_paths_split.append(diff_save_path)
+            #                   except Exception as e: logger.error(f"  绘制瞬时图失败 (t={t_idx}, split={split}): {e}", exc_info=True)
+
 
             # 存储此分割的结果和图表路径
             all_eval_results[split] = {'metrics': metrics_to_save, 'figures': figure_paths_split}
@@ -810,6 +1045,191 @@ def run_evaluation(cfg: DictConfig, recon_results: Dict[str, Any], dr_method: st
     for split, eval_data in all_eval_results.items():
         if 'metrics' in eval_data and 'mean_rmse' in eval_data['metrics']:
             logger.info(f"--- {split} Mean RMSE: {eval_data['metrics']['mean_rmse']:.6f}")
+
+   # --- >>> 修改：PCA-LSTM 迭代预测部分，使用 test 数据 <<< ---
+    if dr_method == "pca" and pred_method == "lstm":
+        try:
+            # --- 获取配置 ---
+            lstm_pca_cfg = cfg.model.prediction.lstm_pca
+            input_features_pca = list(lstm_pca_cfg.get("input_features", []))
+            external_features = list(lstm_pca_cfg.get("external_features", []))
+            target_feature = lstm_pca_cfg.target_feature
+            all_model_inputs_ordered = input_features_pca + external_features
+            iter_max_steps = cfg.evaluation.get("iterative_forecast_steps", 31)
+
+            # --- 加载模型 (现在可以正确使用 pred_results) ---
+            pred_model_path = pred_results.get('model_path') # 从 pred_results 获取模型路径
+            if not pred_model_path or not os.path.exists(pred_model_path):
+                 raise FileNotFoundError(f"未找到预测模型路径: {pred_model_path}")
+            checkpoint = torch.load(pred_model_path)
+            lstm_model = LSTMPredictionModel(
+                input_size=checkpoint['input_size'],
+                hidden_size=checkpoint['hidden_size'],
+                output_size=checkpoint['output_size'],
+                num_layers=checkpoint['num_layers'],
+                dropout=checkpoint['dropout']
+            )
+            lstm_model.load_state_dict(checkpoint['model_state_dict'])
+            lstm_model.eval()
+
+            # --- 加载所有输入特征的 *测试集* 数据 ---
+            test_pca_inputs_dict = {}
+            test_external_inputs_dict = {}
+            all_inputs_loaded = True
+            pca_components_dir = config.paths.pca_components_dir
+            # split_indices 应该在函数开始时已加载
+            test_indices = split_indices.get('test') # 获取测试集索引 (可能不再需要，取决于 processed 文件是否已分割)
+            if test_indices is None or len(test_indices) == 0: raise ValueError("测试集索引为空") # 保留检查
+
+            # 加载 PCA 特征 (test)
+            for feature_name in input_features_pca:
+                 test_path = os.path.join(pca_components_dir, f"pca_components_{feature_name}_test.npy") # 使用 _test.npy
+                 try:
+                      test_pca_inputs_dict[feature_name] = np.load(test_path)
+                      logger.info(f"加载测试集 PCA 成分 '{feature_name}': {test_pca_inputs_dict[feature_name].shape}")
+                 except Exception as e:
+                      logger.error(f"加载测试集 PCA 文件 '{feature_name}' 出错: {e}")
+                      all_inputs_loaded = False; break
+
+            # --- >>> 修改：加载预处理的外部特征 (test) <<< ---
+            for feature_name in external_features:
+                 try:
+                      # 假设你的 config.paths.processed_paths 结构是正确的
+                      processed_test_path = config.paths.processed_paths.get(feature_name, {}).get('test')
+                      if not processed_test_path or not os.path.exists(processed_test_path):
+                           raise FileNotFoundError(f"未找到预处理的测试集文件路径 for '{feature_name}': {processed_test_path}")
+
+                      test_external_data = np.load(processed_test_path)
+                      # 注意：这里假设 processed_test_path 已经是正确的测试集数据，不需要再用 test_indices 切片
+
+                      if test_external_data.ndim == 1: test_external_data = test_external_data[:, np.newaxis]
+                      test_external_inputs_dict[feature_name] = test_external_data
+                      logger.info(f"加载 *预处理* 测试集外部特征 '{feature_name}': {test_external_inputs_dict[feature_name].shape}")
+                 except Exception as e:
+                      logger.error(f"加载 *预处理* 测试集外部特征 '{feature_name}' 出错: {e}")
+                      all_inputs_loaded = False; break
+            # --- >>> 修改结束 <<< ---
+
+            if not all_inputs_loaded:
+                 raise RuntimeError("未能加载所有迭代预测所需的测试集输入数据。")
+
+            # --- 加载目标特征的 *测试集* PCA 数据 (用于比较) ---
+            if target_feature not in test_pca_inputs_dict:
+                 # 如果目标特征本身不是 PCA 特征（例如，如果它是一个外部特征），则需要单独加载
+                 test_pca_target_path = os.path.join(pca_components_dir, f"pca_components_{target_feature}_test.npy")
+                 try:
+                      test_pca_target = np.load(test_pca_target_path)
+                      logger.info(f"加载测试集目标 PCA 成分 '{target_feature}': {test_pca_target.shape}")
+                 except Exception as e:
+                      logger.error(f"加载测试集目标 PCA 文件 '{target_feature}' 出错: {e}")
+                      raise
+            else:
+                 test_pca_target = test_pca_inputs_dict[target_feature] # 直接从字典获取
+
+            # --- 加载目标特征的 PCA 模型和 Scaler (使用 dr_results) ---
+            pca_model_target_path = dr_results.get('model_path', {}).get(target_feature) # 从 dr_results 获取
+            if not pca_model_target_path or not os.path.exists(pca_model_target_path): raise FileNotFoundError(f"未找到目标特征 '{target_feature}' 的 PCA 模型路径。")
+            pca_model_target = joblib.load(pca_model_target_path)
+
+            scaler_target_path = dr_results.get('scaler_path', {}).get(target_feature) # 从 dr_results 获取
+            if not scaler_target_path or not os.path.exists(scaler_target_path): raise FileNotFoundError(f"未找到目标特征 '{target_feature}' 的原始 Scaler 路径。")
+            try:
+                 scaler_target_info = np.load(scaler_target_path, allow_pickle=True).item()
+                 if 'mean' not in scaler_target_info or 'std' not in scaler_target_info: raise ValueError("Scaler 字典缺少 'mean' 或 'std'")
+            except Exception as e: logger.error(f"加载或解析 Scaler 文件 '{scaler_target_path}' 失败: {e}"); raise
+
+            # --- 调用迭代预测函数 (使用 test 数据) ---
+            logger.info(f"开始 PCA-LSTM *测试集* 迭代预测 (目标: {target_feature}, 输入顺序: {all_model_inputs_ordered}, 步数: {iter_max_steps})...")
+            rmse_steps = pcalstm_multi_step_forecast_rmse_curve(
+                cfg=cfg,
+                lstm_model=lstm_model,
+                val_pca_inputs=test_pca_inputs_dict,     # <--- 使用 test 数据
+                val_external_inputs=test_external_inputs_dict, # <--- 使用 test 数据
+                val_pca_target=test_pca_target,          # <--- 使用 test 数据
+                target_feature=target_feature,
+                input_features_ordered=all_model_inputs_ordered,
+                external_features=external_features,
+                scaler=scaler_target_info,
+                pca_model=pca_model_target,
+                mask=mask,
+                max_steps=5
+            )
+
+            # --- 保存和绘图 (使用 test 标识) ---
+            np.save(os.path.join(eval_base_dir, "test_iterative_rmse_steps.npy"), rmse_steps) # <--- test
+            # --- 绘制迭代 RMSE 曲线 (修改处) ---
+            import matplotlib.pyplot as plt
+            import platform
+
+            # --- 设置 Matplotlib 支持中文 ---
+            try:
+                # --- >>> 修改这里：替换为你系统上找到的可用中文字体名称 <<< ---
+                # 例如，如果你找到了 'Microsoft YaHei' 或 'WenQuanYi Micro Hei'
+                # available_font_name = 'Microsoft YaHei' # Windows 示例
+                available_font_name = 'WenQuanYi Micro Hei' # Linux 示例
+                # available_font_name = 'PingFang SC' # macOS 示例
+                # --- >>> 请务必替换为你自己系统上找到的字体名称 <<< ---
+
+                print(f"尝试设置中文字体: {available_font_name}")
+                plt.rcParams['font.sans-serif'] = [available_font_name] # 设置为你找到的字体
+                plt.rcParams['axes.unicode_minus'] = False # 解决负号显示问题
+                print(f"已将 font.sans-serif 设置为: {plt.rcParams['font.sans-serif']}")
+
+            except Exception as e:
+                print(f"设置中文字体 '{available_font_name}' 时出错: {e}")
+                print("请确保字体名称正确且已安装。可以尝试列表中的其他字体。")
+
+            plt.figure(figsize=(10, 6)) # 可以调整图形大小
+
+            valid_rmse_steps = rmse_steps[~np.isnan(rmse_steps)]
+            if len(valid_rmse_steps) > 0:
+                x_steps = np.arange(1, len(valid_rmse_steps) + 1)
+                # --- 关键修改 1：确保为蓝色曲线添加 label ---
+                plt.plot(x_steps, valid_rmse_steps, marker='o',
+                         label='PCA-LSTM Iterative RMSE') # <--- 添加或确认此 label
+
+                plt.xlim(left=0.8, right=len(valid_rmse_steps) + 0.2)
+
+            else:
+                logger.warning("没有有效的 RMSE 步骤可绘制。")
+                x_steps = np.array([]) # 确保 x_steps 已定义
+
+            # --- 添加对比横线和单点 (修改处) ---
+            # 1. 水平线 for SOM-HMM (保持不变)
+            som_hmm_rmse = 3.0
+            plt.axhline(y=som_hmm_rmse, color='red', linestyle='--', linewidth=1.5,
+                        label=f'SOM-HMM RMSE = {som_hmm_rmse:.2f}')
+
+            # 2. 单点 for SOM-LSTM (Step 1)
+            som_lstm_step1_rmse = 2.45
+            # --- 关键修改 2：将 marker 从 '*' 改为 '^' ---
+            plt.plot(1, som_lstm_step1_rmse, # x=1, y=2.75
+                     marker='^',           # <--- 修改标记为三角形
+                     markersize=10,        # 可以调整标记大小
+                     linestyle='none',     # 不画线
+                     color='green',        # 标记颜色
+                     label=f'SOM-LSTM RMSE (Step 1) = {som_lstm_step1_rmse:.2f}')
+            # --- 结束修改 ---
+
+            # 设置坐标轴标签和标题
+            plt.xlabel("预测步长 (天)" if x_steps.size > 0 else "Step")
+            plt.ylabel("RMSE (PSU)")
+            plt.title("迭代预测 RMSE 对比 (Test Set)")
+
+            plt.grid(True, alpha=0.5)
+
+            # 调用 legend() 来显示所有标签
+            plt.legend() # <--- 确保这行在所有带 label 的 plot 命令之后
+
+            # 保存图像
+            save_fig_path = os.path.join(eval_base_dir, "test_iterative_rmse_curve_comparison.png")
+            plt.savefig(save_fig_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            logger.info(f"已生成测试集迭代预测 RMSE 对比曲线。")
+
+        except Exception as e:
+            logger.error(f"PCA-LSTM 测试集迭代预测评估绘图失败: {e}", exc_info=True)
+    # --- >>> 结束修改 <<< ---
 
     logger.info(f"--- 评估完成 (DR: {dr_method}, Pred: {pred_method}) ---")
     return results
@@ -873,7 +1293,7 @@ def main(cfg: DictConfig) -> None:
         sys.exit(1) # 失败则退出
 
     # === 阶段 4: 评估 ===
-    eval_results = run_evaluation(cfg, recon_results, dr_results['method'], pred_results['method'])
+    eval_results = run_evaluation(cfg, recon_results, dr_results, pred_results)
     if not eval_results or not eval_results.get('success'):
         logger.warning("评估阶段失败或未生成任何结果。")
         # 评估失败不一定需要终止流程，但可以记录

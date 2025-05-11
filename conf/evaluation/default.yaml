@@ -1,8 +1,8 @@
 # conf/evaluation/default.yaml
-calculate_correlation: true
-calculate_spatial_metrics: true
-save_spatial_metrics: true
-plot_results: true
+calculate_correlation: True
+calculate_spatial_metrics: True
+save_spatial_metrics: True
+plot_results: True
 compare_with_baseline: false
 # --- 评估指标配置 ---
 metrics:

@@ -29,7 +29,7 @@ som:
   map_size: [3,3] # 提供sal的地图尺寸
   map_size_obs : [3,3] # 提供obs的地图尺寸
   learning_rate: 0.1
-  n_iterations: 200
+  n_iterations: 100
   neighborhood_size: null
   sigma: 1.25
 

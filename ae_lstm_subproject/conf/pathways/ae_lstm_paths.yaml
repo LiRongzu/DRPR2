@@ -1,0 +1,26 @@
+paths:
+  processed_paths:
+    salinity:
+      train: data/processed/salinity_train.npy
+      val: data/processed/salinity_val.npy
+      test: data/processed/salinity_test.npy
+  scaler_paths:
+    salinity: data/scaler/salinity_scaler.npy
+  ae_model_path: models/ae_lstm/ae_model.pth
+  latent_salinity_paths:
+    train: data/latent/salinity_train_latent.npy
+    val: data/latent/salinity_val_latent.npy
+    test: data/latent/salinity_test_latent.npy
+  lstm_input_scaler_path: models/ae_lstm/lstm_input_scaler.pkl
+  latent_salinity_target_scaler_path: models/ae_lstm/latent_target_scaler.pkl
+  lstm_model_path: models/ae_lstm/lstm_model.pth
+  predicted_latent_salinity_paths:
+    train: data/predicted/latent_sal_train.npy
+    val: data/predicted/latent_sal_val.npy
+    test: data/predicted/latent_sal_test.npy
+  reconstructed_salinity_paths:
+    train: data/reconstructed/sal_train.npy
+    val: data/reconstructed/sal_val.npy
+    test: data/reconstructed/sal_test.npy
+  results_subdir: results
+  plots_subdir: plots

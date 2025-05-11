@@ -26,12 +26,245 @@ from utils.data_loader import load_mask # 假设 load_mask 在这里
 from evaluation import visualization as eval_viz
 # 假设指标计算函数在 eval_metrics 中
 from evaluation import metrics as eval_metrics
-
+# 添加在导入部分
+# from data.sequence_dataset import TimeSeriesDataset  # 多步预测数据集
+# from models.multi_step_lstm import MultiStepLSTM  # 多步预测模型
+# from training.multi_step_trainer import train_multi_step_lstm  # 多步预测训练函数
+# from evaluation.multi_step_evaluation import evaluate_multi_step_predictions  # 多步预测评估
+from torch.utils.data import DataLoader
+from src.evaluation.visualization import (
+    plot_comparison_and_error,
+    plot_spatial_rmse,
+    plot_spatial_comparison_at_timestep, # 新增：绘制特定时间点对比图
+    plot_spatial_difference,            # 新增：绘制特定时间点差异图
+    plot_spatial_statistic,             # 新增：绘制通用空间统计图
+    calculate_correlation_map,          # 新增：计算相关性图的函数
+    plot_comparison_and_error_adjusted_style,
+    generate_evaluation_report,         # 新增：生成评估报告的函数
+    plot_spatial_distribution,            # 如果需要 heatmap 也导入
+    plot_spatial_rmse_optimized
+)
+import matplotlib.pyplot as plt
+import platform
+from typing import Dict, Any, List, Optional
 # --- 配置日志记录器 ---
 log = logging.getLogger(__name__) # Hydra 会配置好
 # --- 设备配置 ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 log.info(f"正在使用设备: {device}")
+
+def aelstm_multi_step_forecast_rmse_curve_minimal(
+    cfg: DictConfig,
+    ae_results: dict, # 需要里面的 'model_path' 和 'salinity_scaler_params'
+    pred_results: dict, # 需要里面的模型和 scaler 路径
+    all_processed_data: dict, # 需要里面的原始 salinity 数据 ('test' split)
+    mask: np.ndarray, # 需要 Mask
+    device: torch.device # 需要计算设备
+) -> np.ndarray:
+    """
+    (最小改动版)
+    计算 AE-LSTM 的多步迭代预测 RMSE 曲线。
+    此函数负责加载所有必需的模型、Scaler 和预存的标准化数据。
+    使用标准的 lstm_model.predict() 方法。
+    """
+    log.info("--- 开始最小改动版 AE-LSTM 迭代预测评估 ---")
+
+    try:
+        # --- 1. 加载模型 ---
+        # LSTM Model
+        lstm_model_path = pred_results.get('model_path')
+        if not lstm_model_path or not os.path.exists(lstm_model_path): raise FileNotFoundError("LSTM 模型路径未在 pred_results 中找到或文件不存在")
+        lstm_cfg = cfg.model.prediction.lstm_ae
+        # 确定 LSTM 输入维度 (需要从 pred_results 或重新计算得到)
+        # 假设 pred_results 包含了 input_dims_list (如果 run_lstm_prediction 返回了)
+        # if 'input_dims_list' not in pred_results:
+        #     raise ValueError("pred_results 中缺少 'input_dims_list'，无法确定 LSTM 输入维度") # 或者在这里重新计算
+        lstm_input_dim = 15
+        lstm_output_dim = ae_results['encoding_dim']
+        lstm_model_eval = LSTMPredictionModel(
+            input_size=lstm_input_dim, hidden_size=lstm_cfg.hidden_size,
+            num_layers=lstm_cfg.num_layers, output_size=lstm_output_dim,
+            dropout=lstm_cfg.get('dropout', 0.0), device=device # 传递 device
+        )
+        lstm_model_eval.load(lstm_model_path)
+        lstm_model_eval.to(device) # 确保在设备上
+        lstm_model_eval.eval()
+        log.info(f"LSTM 模型已加载: {lstm_model_path}")
+
+        # AE Model
+        ae_model_path = ae_results.get('model_path')
+        if not ae_model_path or not os.path.exists(ae_model_path): raise FileNotFoundError("AE 模型路径未在 ae_results 中找到或文件不存在")
+        ae_model_eval = AutoencoderDimensionalityReduction.load(ae_model_path, device=device)
+        ae_model_eval.model.to(device) # 确保在设备上
+        ae_model_eval.model.eval() # 确保在评估模式
+        log.info(f"AE 模型已加载: {ae_model_path}")
+
+        # --- 2. 加载 Scalers ---
+        lstm_input_scaler_path = pred_results.get('lstm_input_scaler_path')
+        latent_target_scaler_path = pred_results.get('latent_salinity_target_scaler_path')
+        if not lstm_input_scaler_path or not latent_target_scaler_path: raise ValueError("pred_results 中缺少 Scaler 路径")
+        lstm_input_scaler = load_scaler_pkl(lstm_input_scaler_path)
+        latent_target_scaler = load_scaler_pkl(latent_target_scaler_path)
+        salinity_scaler_params = ae_results.get('salinity_scaler_params')
+        if not lstm_input_scaler or not latent_target_scaler or not salinity_scaler_params: raise ValueError("一个或多个 Scaler 加载失败")
+        log.info("所有 Scaler 加载成功")
+
+        # --- 3. 加载预存的标准化测试数据 ---
+        # 从配置文件获取路径 (更健壮)
+        scaled_input_path = cfg.paths.get("lstm_scaled_input_path")
+        scaled_target_path = cfg.paths.get("lstm_scaled_target_path")
+        if not scaled_input_path or not scaled_target_path: raise ValueError("配置文件中缺少 lstm_scaled_input/target_path")
+        if not os.path.exists(scaled_input_path) or not os.path.exists(scaled_target_path): raise FileNotFoundError("未找到预存的 scaled input/target npy 文件")
+
+        test_lstm_inputs_scaled_all = np.load(scaled_input_path, allow_pickle=True).item() # 加载字典
+        test_latent_salinity_true_scaled_all = np.load(scaled_target_path, allow_pickle=True).item() # 加载字典
+
+        test_split_name = 'test'
+        if test_split_name not in test_lstm_inputs_scaled_all or test_split_name not in test_latent_salinity_true_scaled_all:
+            raise ValueError(f"预存的 scaled data npy 文件中缺少 '{test_split_name}' 的数据")
+
+        test_lstm_inputs_scaled = test_lstm_inputs_scaled_all[test_split_name]
+        # test_latent_salinity_true_scaled = test_latent_salinity_true_scaled_all[test_split_name] # 实际上迭代循环中不需要这个
+
+        # --- 4. 加载原始高维真值数据 (Test) ---
+        if 'salinity' not in all_processed_data or test_split_name not in all_processed_data['salinity']:
+            raise ValueError("all_processed_data 中缺少 salinity['test'] 数据")
+        test_salinity_processed = all_processed_data['salinity'][test_split_name]
+        test_salinity_true_raw = inverse_scaling(test_salinity_processed, salinity_scaler_params)
+
+        # --- 5. 准备迭代预测 ---
+        sequence_length = cfg.model.prediction.lstm_ae.sequence_length
+        max_steps = cfg.evaluation.get("iterative_forecast_steps", 5)
+        num_samples = test_lstm_inputs_scaled.shape[0]
+        num_rolls = num_samples - sequence_length - max_steps + 1
+
+        if num_rolls <= 0:
+            log.error(f"数据不足 ({num_samples}) 以进行 {max_steps} 步迭代预测 (序列长度 {sequence_length})。")
+            return np.full((max_steps,), np.nan)
+
+        # 获取目标范围 (与之前函数类似)
+        # input_dims_list = pred_results.get('input_dims_list', [])
+        input_dims_list = [15,1]
+        input_source_names = ["salinity","flow"]
+        if not input_dims_list or not input_source_names: raise ValueError("无法从 pred_results 获取 input_dims_list 或 input_source_names")
+        input_ranges: Dict[str, tuple[int, int]] = {}
+        current_start_idx = 0
+        target_feature_name = 'salinity' # 假设目标是盐度
+        target_range: Optional[tuple[int, int]] = None
+        for name, dim in zip(input_source_names, input_dims_list):
+             input_ranges[name] = (current_start_idx, current_start_idx + dim)
+             # 假设名字包含 'salinity' 的是目标潜变量
+             if 'salinity' in name.lower(): target_range = input_ranges[name]
+             current_start_idx += dim
+        if target_range is None: raise ValueError("无法确定目标 'salinity' 在输入中的范围")
+
+        rmse_curve = []
+        start_step = 2
+
+        # --- 6. 执行迭代预测循环 ---
+        for steps_ahead in range(start_step, max_steps + 1):
+            errors_for_this_step = []
+            for roll_start in range(num_rolls):
+                # 准备初始序列 (scaled)
+                current_sequence_scaled_np = test_lstm_inputs_scaled[roll_start : roll_start + sequence_length]
+                current_sequence_scaled = torch.tensor(current_sequence_scaled_np, dtype=torch.float32).to(device)
+
+                predicted_target_scaled_last_step_np = None # 存最终预测 (scaled latent)
+
+                temp_sequence_tensor = current_sequence_scaled.clone()
+
+                for step in range(steps_ahead):
+                     # 使用标准 predict 方法 (传入单一样本的 batch)
+                     input_batch_tensor = temp_sequence_tensor.unsqueeze(0) # Shape: (1, seq_len, features)
+
+                     # --- VVVVVV 在这里添加包装代码 VVVVVV ---
+                     # 1. 创建一个只包含当前批次的 TensorDataset
+                     #    注意：确保 input_batch_tensor 在 CPU 或 GPU 上与你的 predict 方法期望的一致
+                     #    如果 predict 方法内部处理 device，放 CPU 可能更安全；否则保持在 device 上。
+                     #    我们假设 predict 能处理 device 上的 Tensor。
+                     temp_dataset = torch.utils.data.TensorDataset(input_batch_tensor)
+
+                     # 2. 创建一个 DataLoader，batch_size=1
+                     temp_loader = torch.utils.data.DataLoader(temp_dataset, batch_size=1)
+                     # --- ^^^^^^ 包装代码结束 ^^^^^^ ---
+
+                     # 假设 predict 返回 NumPy 数组 (N, output_dim), N=1 in this case
+                     # --- VVVVVV 修改调用，传入 temp_loader VVVVVV ---
+                     pred_target_scaled_np = lstm_model_eval.predict(temp_loader) # <--- 传入包装好的 DataLoader
+                     # --- ^^^^^^ 修改结束 ^^^^^^ ---
+
+                     # predict 方法应该返回 (N, output_dim) 的 NumPy 数组，对于单步预测 N=1
+                     # 可能需要 flatten() 来确保后续处理的是 1D 数组
+                     pred_target_scaled_np = pred_target_scaled_np.flatten()
+
+                     if step == steps_ahead - 1:
+                          predicted_target_scaled_last_step_np = pred_target_scaled_np
+
+
+                     # 构造下一步输入 (scaled)
+                     current_time_idx_in_test = roll_start + sequence_length + step
+                     next_input_features_known_scaled = test_lstm_inputs_scaled[current_time_idx_in_test]
+                     next_input_scaled_np = next_input_features_known_scaled.copy()
+
+                     s_start, s_end = target_range
+                     if pred_target_scaled_np.shape[0] != (s_end - s_start):
+                          log.error(f"预测维度 ({pred_target_scaled_np.shape[0]}) 与目标范围 ({s_end - s_start}) 不匹配 (step {step+1}/{steps_ahead}, roll {roll_start})")
+                          predicted_target_scaled_last_step_np = None; break # Fail this roll
+
+                     next_input_scaled_np[s_start:s_end] = pred_target_scaled_np
+                     next_input_scaled_tensor = torch.tensor(next_input_scaled_np, dtype=torch.float32).to(device)
+
+                     # 更新序列
+                     temp_sequence_tensor = torch.cat([temp_sequence_tensor[1:], next_input_scaled_tensor.unsqueeze(0)], dim=0)
+
+                # --- Loop for 'steps_ahead' finished ---
+                if predicted_target_scaled_last_step_np is None:
+                    errors_for_this_step.append(np.nan); continue
+
+                # --- 7. 反变换到高维原始空间 ---
+                try:
+                    pred_latent_unscaled = latent_target_scaler.inverse_transform(predicted_target_scaled_last_step_np.reshape(1, -1))
+                    recon_highdim_scaled = ae_model_eval.decode(pred_latent_unscaled)
+                    recon_highdim_raw = inverse_scaling(recon_highdim_scaled, salinity_scaler_params).flatten()
+                except Exception as e_inv:
+                    log.error(f"反变换失败 (roll {roll_start}, step {steps_ahead}): {e_inv}", exc_info=True)
+                    errors_for_this_step.append(np.nan); continue
+
+                # --- 8. 获取真值并计算 RMSE ---
+                gt_time_idx = roll_start + sequence_length + steps_ahead - 1
+                try:
+                    # 需要从原始未对齐的数据中获取真值
+                    gt_highdim_raw = test_salinity_true_raw[gt_time_idx]
+                    # 假设 gt_highdim_raw 已经是展平的有效点数据
+                except IndexError:
+                    log.error(f"无法获取 GT 数据索引 {gt_time_idx} (roll {roll_start}, step {steps_ahead})")
+                    errors_for_this_step.append(np.nan); continue
+
+                # 确保维度匹配 (假设都是有效点展平后)
+                if recon_highdim_raw.shape[0] != gt_highdim_raw.shape[0]:
+                     log.error(f"预测 ({recon_highdim_raw.shape}) 和 GT ({gt_highdim_raw.shape}) 的有效点维度不匹配")
+                     errors_for_this_step.append(np.nan); continue
+
+                mse = np.mean((recon_highdim_raw - gt_highdim_raw) ** 2)
+                if np.isnan(mse): errors_for_this_step.append(np.nan)
+                else: errors_for_this_step.append(np.sqrt(mse))
+
+            # --- Loop for 'roll_start' finished ---
+            valid_errors = [e for e in errors_for_this_step if not np.isnan(e)]
+            avg_rmse_for_step = float(np.mean(valid_errors)) if valid_errors else np.nan
+            rmse_curve.append(avg_rmse_for_step)
+            log.debug(f"Step {steps_ahead}: Avg RMSE = {avg_rmse_for_step:.4f} (from {len(valid_errors)}/{num_rolls} rolls)")
+
+        # --- Loop for 'steps_ahead' finished ---
+        log.info("--- 完成最小改动版 AE-LSTM 迭代预测评估 ---")
+        return np.array(rmse_curve)
+
+    except (FileNotFoundError, ValueError) as setup_err:
+        log.error(f"迭代预测评估设置失败: {setup_err}", exc_info=True)
+        return np.full((cfg.evaluation.get("iterative_forecast_steps", 5),), np.nan) # Return NaNs on setup failure
+    except Exception as e_runtime:
+        log.error(f"迭代预测评估运行时出错: {e_runtime}", exc_info=True)
+        return np.full((cfg.evaluation.get("iterative_forecast_steps", 5),), np.nan) # Return NaNs on runtime failure
 
 # === 辅助函数: Scaler 处理 ===
 # !! 重要: 这些函数需要你根据 .npy 文件的实际内容进行适配 !!
@@ -359,8 +592,10 @@ def run_flow_processing(cfg: DictConfig):
     return results
 
 # === 3. LSTM 预测步骤 ===
-def run_lstm_prediction(cfg: DictConfig, ae_results: dict, wind_results: dict, flow_results: dict = None):
-    """训练LSTM，根据配置灵活组合潜空间盐度、预计算的低维风场和流场数据"""
+def run_lstm_prediction(cfg, ae_results, wind_results=None, flow_results=None):
+    """
+    运行LSTM预测 - 支持多步预测
+    """
     log.info("--- 开始步骤 3: LSTM 预测 ---")
     results = {'success': False}
     
@@ -420,6 +655,7 @@ def run_lstm_prediction(cfg: DictConfig, ae_results: dict, wind_results: dict, f
         
         log.info(f"LSTM将使用以下数据源: {', '.join(data_source_names)}")
         
+        
         # 3.2 确定所有数据源共有的分割
         common_splits = set(Z_sal.keys())  # 从盐度数据初始化
         for src in input_sources:
@@ -452,23 +688,25 @@ def run_lstm_prediction(cfg: DictConfig, ae_results: dict, wind_results: dict, f
         save_scaler_pkl(latent_target_scaler, latent_salinity_target_scaler_path)
         results['latent_salinity_target_scaler_path'] = latent_salinity_target_scaler_path
 
-
+        # ————————————————————————————————————————————————————————————————————————————————————————————————————————
+            
+        
         # 3.6 创建 LSTM 序列
         log.info("为 LSTM 创建序列...")
         sequences = {}
         seq_len = cfg.model.prediction.lstm_ae.sequence_length
         for split in lstm_input_scaled.keys():
-             if split not in Z_sal_target_scaled: continue
-             # 确保数据足够长以创建序列
-             if lstm_input_scaled[split].shape[0] <= seq_len or Z_sal_target_scaled[split].shape[0] <= seq_len:
-                  log.warning(f"Split '{split}' data length ({lstm_input_scaled[split].shape[0]}) is not greater than sequence length ({seq_len}). Skipping sequence creation.")
-                  continue
-             X_seq, _ = sequence_utils.create_sequences_ae(lstm_input_scaled[split], seq_len)
-             _, y_seq = sequence_utils.create_sequences_ae(Z_sal_target_scaled[split], seq_len)
-             if X_seq.shape[0] != y_seq.shape[0]: raise ValueError(f"X_seq 和 y_seq 的样本数不匹配: {X_seq.shape[0]} vs {y_seq.shape[0]}")
-             if X_seq.shape[0] == 0: continue
-             sequences[split] = {'X': X_seq, 'y': y_seq}
-             log.info(f"{split} 的序列: X={X_seq.shape}, y={y_seq.shape}")
+            if split not in Z_sal_target_scaled: continue
+            # 确保数据足够长以创建序列
+            if lstm_input_scaled[split].shape[0] <= seq_len or Z_sal_target_scaled[split].shape[0] <= seq_len:
+                log.warning(f"Split '{split}' data length ({lstm_input_scaled[split].shape[0]}) is not greater than sequence length ({seq_len}). Skipping sequence creation.")
+                continue
+            X_seq, _ = sequence_utils.create_sequences_ae(lstm_input_scaled[split], seq_len)
+            _, y_seq = sequence_utils.create_sequences_ae(Z_sal_target_scaled[split], seq_len)
+            if X_seq.shape[0] != y_seq.shape[0]: raise ValueError(f"X_seq 和 y_seq 的样本数不匹配: {X_seq.shape[0]} vs {y_seq.shape[0]}")
+            if X_seq.shape[0] == 0: continue
+            sequences[split] = {'X': X_seq, 'y': y_seq}
+            log.info(f"{split} 的序列: X={X_seq.shape}, y={y_seq.shape}")
         results['target_sequences'] = {split: sequences[split]['y'] for split in sequences}
         if 'train' not in sequences or sequences['train']['X'].shape[0] == 0: raise ValueError("未创建训练序列。")
 
@@ -530,6 +768,26 @@ def run_lstm_prediction(cfg: DictConfig, ae_results: dict, wind_results: dict, f
         results['predicted_latent_salinity_paths'] = predicted_latent_salinity_paths
         results['predicted_latent_data_scaled'] = predicted_latent_data_scaled
 
+        # --- (最小改动) 保存标准化后的数据以供后续迭代评估使用 ---
+        try:
+            scaled_input_path = cfg.paths.get("lstm_scaled_input_path", os.path.join(os.getcwd(), "intermediate", "lstm_input_scaled.npy")) # 从配置获取路径或默认
+            scaled_target_path = cfg.paths.get("lstm_scaled_target_path", os.path.join(os.getcwd(), "intermediate", "lstm_target_scaled.npy")) # 从配置获取路径或默认
+            os.makedirs(os.path.dirname(scaled_input_path), exist_ok=True)
+            os.makedirs(os.path.dirname(scaled_target_path), exist_ok=True)
+
+            # 保存包含所有分割的字典，或者只保存 test 分割的数据
+            # 保存字典更灵活
+            np.save(scaled_input_path, lstm_input_scaled)
+            np.save(scaled_target_path, Z_sal_target_scaled)
+            log.info(f"已保存标准化 LSTM 输入数据至: {scaled_input_path}")
+            log.info(f"已保存标准化 LSTM 目标数据至: {scaled_target_path}")
+            # 将路径存入 results，方便后续查找 (可选)
+            results['lstm_scaled_input_path'] = scaled_input_path
+            results['lstm_scaled_target_path'] = scaled_target_path
+        except Exception as e_save:
+            log.warning(f"无法保存标准化的 LSTM 输入/目标数据: {e_save}", exc_info=True)
+            # 不应让此失败导致整个步骤失败，但后续迭代评估可能无法进行
+
         results['success'] = True
         log.info("--- 完成步骤 3: LSTM 预测 ---")
         
@@ -563,37 +821,46 @@ def run_salinity_reconstruction(cfg: DictConfig, ae_results: dict, pred_results:
         predicted_latent_data_scaled = pred_results.get('predicted_latent_data_scaled', {})
         if not predicted_latent_data_scaled:
             predicted_latent_data_scaled = {split: np.load(path) for split, path in pred_results['predicted_latent_salinity_paths'].items()}
-
-        reconstructed_paths = {}
+        # 添加: 处理主要预测结果的重建
+        log.info("重建主要预测结果...")
         reconstructed_data = {}
-        # 4.3 解码和重建
+        reconstructed_paths = {}
+        
         for split, Z_pred_sal_scaled in predicted_latent_data_scaled.items():
-            log.info(f"正在为分割 {split} 重建盐度...")
-            # 使用运行时目标 scaler (.pkl) 逆变换
+            # 逆标准化潜空间数据
             Z_pred_sal_orig = latent_target_scaler.inverse_transform(Z_pred_sal_scaled)
-            # 使用 AE 解码器
+            
+            # 使用AE模型解码
             X_rec_sal_scaled_np = ae_model.decode(Z_pred_sal_orig)
-            # 使用预计算原始 scaler 参数 (.npy) 逆变换
+            
+            # 逆变换回原始尺度
             X_reconstructed_salinity = inverse_scaling(X_rec_sal_scaled_np, salinity_scaler_params)
+            
+            # 保存重建的数据
             reconstructed_data[split] = X_reconstructed_salinity
-            # 保存重建结果到运行目录
-            rec_path = cfg.paths.reconstructed_salinity_paths[split] # 指向 output_dir/.../reconstructed...npy
+            
+            # 保存到文件
+            rec_path = cfg.paths.reconstructed_salinity_paths[split]
             os.makedirs(os.path.dirname(rec_path), exist_ok=True)
             np.save(rec_path, X_reconstructed_salinity)
             reconstructed_paths[split] = rec_path
-            log.info(f"{split} 的重建盐度 ({X_reconstructed_salinity.shape}) 已保存至 (运行目录): {rec_path}")
-
-        results['reconstructed_salinity_paths'] = reconstructed_paths
+            log.info(f"{split}的重建盐度({X_reconstructed_salinity.shape})已保存至: {rec_path}")
+        
+        # 将重建数据添加到结果中
         results['reconstructed_data'] = reconstructed_data
+        results['reconstructed_paths'] = reconstructed_paths
+
+     
         results['success'] = True
         log.info("--- 完成步骤 4: 盐度重建 ---")
+
     except Exception as e:
         log.error(f"重建步骤出错: {e}", exc_info=True)
         results['success'] = False
     return results
 
 # === 5. 评估步骤 ===
-def run_evaluation(cfg: DictConfig, rec_results: dict, all_processed_data: dict, ae_results: dict):
+def run_evaluation(cfg: DictConfig, rec_results: dict, all_processed_data: dict, ae_results: dict, pred_results: dict):
     """评估重建结果，对所有可用的分割 (train, val, test) 进行详细评估和可视化。"""
     log.info("--- 开始步骤 5: 评估 (详细版 - 所有分割) ---")
     results = {'success': False, 'evaluation_details': {}} # 初始化 success 和详细结果字典
@@ -724,13 +991,17 @@ def run_evaluation(cfg: DictConfig, rec_results: dict, all_processed_data: dict,
                  current_metrics["max_rmse"] = np.nanmax(rmse_field) if np.any(np.isfinite(rmse_field)) else np.nan
                  current_metrics["min_rmse"] = np.nanmin(rmse_field) if np.any(np.isfinite(rmse_field)) else np.nan
                  if cfg.evaluation.get("calculate_correlation", False):
-                      try:
-                           corr_map = eval_metrics.calculate_correlation_map(orig_spatial_masked, recon_spatial, boolean_mask)
-                           current_metrics['correlation_map'] = corr_map
-                           mean_corr = np.nanmean(corr_map) if np.any(np.isfinite(corr_map)) else np.nan
-                           current_metrics['mean_correlation'] = mean_corr
-                           log.info(f"  {split} - 平均空间相关性: {mean_corr:.6f}")
-                      except Exception as e_corr: log.error(...) ; current_metrics['mean_correlation'] = np.nan
+                    try:
+                        corr_map = calculate_correlation_map(orig_spatial_masked, recon_spatial, boolean_mask)
+                        current_metrics['correlation_map'] = corr_map
+                        mean_corr = np.nanmean(corr_map) if np.any(np.isfinite(corr_map)) else np.nan
+                        current_metrics['mean_correlation'] = mean_corr
+                        log.info(f"  {split} - 平均空间相关性: {mean_corr:.6f}")
+                    except Exception as e_corr:
+                        log.error(f"计算相关性时出错: {e_corr}", exc_info=True)
+                        current_metrics['mean_correlation'] = np.nan
+                        # 确保错误处理中也设置correlation_map
+                        current_metrics['correlation_map'] = np.full(target_spatial_shape, np.nan)
             else:
                  log.warning(f"分割 '{split}': Mask 中没有有效点，指标将为 NaN。")
                  current_metrics = {k: np.nan for k in ["mean_rmse", "mean_mae", "max_rmse", "min_rmse"]}
@@ -740,7 +1011,6 @@ def run_evaluation(cfg: DictConfig, rec_results: dict, all_processed_data: dict,
             # --- 5.5 保存指标 ---
             log.info(f"保存评估指标 ({split})...")
             metrics_to_save_converted = {}
-            # ... (指标转换逻辑不变) ...
             for key, value in current_metrics.items():
                  if key not in ["rmse_map", "correlation_map"]:
                       if isinstance(value, (np.float16, np.float32, np.float64, np.floating)): 
@@ -773,71 +1043,87 @@ def run_evaluation(cfg: DictConfig, rec_results: dict, all_processed_data: dict,
 
             split_metrics = metrics_to_save_converted # 存储转换后的指标
 
-            # --- 5.6 可视化 ---
-            log.info(f"生成可视化图表 ({split})...")
-            if cfg.visualization.enabled and num_valid_points_mask > 0:
-                dr_method = cfg.model.dimensionality_reduction.method
-                pred_method = cfg.model.prediction.method
-                title_suffix = f"({split.capitalize()} - {dr_method}_{pred_method})"
+            # # --- 5.6 可视化 ---
+            # log.info(f"生成可视化图表 ({split})...")
+            # if cfg.visualization.enabled and num_valid_points_mask > 0:
+            #     dr_method = cfg.model.dimensionality_reduction.method
+            #     pred_method = cfg.model.prediction.method
+            #     title_suffix = f"({split.capitalize()})"
 
-                try:
-                    # 时间序列对比图 (空间平均)
-                    rec_mean_ts = np.nanmean(recon_valid_flat, axis=1)
-                    orig_mean_ts = np.nanmean(orig_valid_flat, axis=1)
-                    ts_save_path = os.path.join(plots_dir, f"time_series_comparison_{split}.png") # 文件名包含 split
-                    eval_viz.plot_time_series_comparison(
-                        original=orig_mean_ts, reconstructed=rec_mean_ts, cfg=cfg,
-                        title=f"Spatial Mean Time Series {title_suffix}", save_path=ts_save_path
-                    )
-                    figure_paths_split.append(ts_save_path)
+            #     try:
+            #         # 时间序列对比图 (空间平均)
+            #         rec_mean_ts = np.nanmean(recon_valid_flat, axis=1)
+            #         orig_mean_ts = np.nanmean(orig_valid_flat, axis=1)
+            #         ts_save_path = os.path.join(plots_dir, f"time_series_comparison_{split}.png") # 文件名包含 split
+            #         eval_viz.plot_comparison_and_error(
+            #             original=orig_mean_ts, reconstructed=rec_mean_ts, config=cfg,
+            #             fig_title=f"时间序列对比与误差分析 (Time Series Comparison and Error Analysis)", save_path=ts_save_path
+            #         )
+            #         figure_paths_split.append(ts_save_path)
 
-                    # 空间 RMSE 图
-                    if "rmse_map" in current_metrics and np.any(np.isfinite(current_metrics["rmse_map"])):
-                         spatial_rmse_save_path = os.path.join(plots_dir, f"spatial_rmse_{split}.png") # 文件名包含 split
-                         eval_viz.plot_spatial_rmse(
-                              current_metrics["rmse_map"], cfg=cfg, mask=boolean_mask,
-                              title=f"Spatial RMSE {title_suffix}", save_path=spatial_rmse_save_path
-                         )
-                         figure_paths_split.append(spatial_rmse_save_path)
+            #         # 空间 RMSE 图
+            #         if "rmse_map" in current_metrics and np.any(np.isfinite(current_metrics["rmse_map"])):
+            #              spatial_rmse_save_path = os.path.join(plots_dir, f"spatial_rmse_{split}.png") # 文件名包含 split
+            #              eval_viz.plot_spatial_rmse(
+            #                   current_metrics["rmse_map"], cfg=cfg, mask=boolean_mask,
+            #                   title=f"空间RMSE分布", save_path=spatial_rmse_save_path
+            #              )
+            #              figure_paths_split.append(spatial_rmse_save_path)
 
-                    # (可选) 空间相关性图
-                    if cfg.evaluation.get("calculate_correlation", False) and "correlation_map" in current_metrics and np.any(np.isfinite(current_metrics["correlation_map"])):
-                         if cfg.evaluation.visualization.get("plot_spatial_correlation", True):
-                              corr_save_path = os.path.join(plots_dir, f"spatial_correlation_{split}.png") # 文件名包含 split
-                              eval_viz.plot_spatial_statistic(
-                                   current_metrics['correlation_map'], cfg=cfg, mask=boolean_mask, save_path=corr_save_path,
-                                   title=f"Spatial Correlation {title_suffix}",
-                                   cmap='coolwarm', vmin=-1, vmax=1, cbar_label="Correlation Coeff."
-                              )
-                              figure_paths_split.append(corr_save_path)
+            #         # (可选) 空间相关性图
+            #         if cfg.evaluation.get("calculate_correlation", True) and "correlation_map" in current_metrics :
+            #              if cfg.evaluation.visualization.get("plot_spatial_correlation", True):
+            #                   corr_save_path = os.path.join(plots_dir, f"spatial_correlation_{split}.png") # 文件名包含 split
+            #                   eval_viz.plot_spatial_statistic(
+            #                        current_metrics['correlation_map'], cfg=cfg, mask=~boolean_mask, save_path=corr_save_path,
+            #                        title=f"相关性分步",
+            #                        cmap='coolwarm', vmin=-1, vmax=1, cbar_label="相关性系数"
+            #                   )
+            #                   figure_paths_split.append(corr_save_path)
 
-                    # (可选) 瞬时对比图
-                    if cfg.evaluation.visualization.get("plot_instantaneous", False):
-                        time_indices_to_plot = cfg.evaluation.visualization.get("time_indices_to_plot", [0, n_samples // 2, n_samples - 1])
-                        log.info(f"  绘制特定时间点的空间图 ({split}, indices={time_indices_to_plot})...")
-                        for t_idx in time_indices_to_plot:
-                            if 0 <= t_idx < n_samples:
-                                 try:
-                                      comp_save_path = os.path.join(plots_dir, f"spatial_comparison_{split}_t{t_idx}.png") # 文件名包含 split 和 t_idx
-                                      eval_viz.plot_spatial_comparison_at_timestep(...) # 调用不变
-                                      figure_paths_split.append(comp_save_path)
-                                      if cfg.evaluation.visualization.get("plot_instantaneous_difference_only", True):
-                                           diff_save_path = os.path.join(plots_dir, f"spatial_difference_{split}_t{t_idx}.png") # 文件名包含 split 和 t_idx
-                                           eval_viz.plot_spatial_difference(...) # 调用不变
-                                           figure_paths_split.append(diff_save_path)
-                                 except Exception as e_inst: log.error(f"  绘制瞬时图失败 (t={t_idx}, split={split}): {e_inst}", exc_info=True)
+            #         # (可选) 瞬时对比图
+            #         if cfg.evaluation.get("plot_instantaneous", True):
+            #             time_indices_to_plot = cfg.evaluation.visualization.get("time_indices_to_plot", [0, n_samples // 2, n_samples - 1])
+            #             log.info(f"  绘制特定时间点的空间图 ({split}, indices={time_indices_to_plot})...")
+            #             for t_idx in time_indices_to_plot:
+            #                 if 0 <= t_idx < n_samples:
+            #                      try:
+            #                           comp_save_path = os.path.join(plots_dir, f"spatial_comparison_{split}_t{t_idx}.png") # 文件名包含 split 和 t_idx
+            #                           eval_viz.plot_spatial_comparison_at_timestep(
+            #                               np.squeeze(orig_spatial_masked[t_idx]), 
+            #                               recon_spatial[t_idx], 
+            #                               diff_spatial[t_idx], 
+            #                               cfg=cfg, 
+            #                               mask=~boolean_mask, 
+            #                               time_index=t_idx, 
+            #                               save_path=comp_save_path,
+            #                               title_prefix=f"盐度场抽样对比"
+            #                           )
+            #                           figure_paths_split.append(comp_save_path)
+            #                           if cfg.evaluation.visualization.get("plot_instantaneous_difference_only", True):
+            #                                diff_save_path = os.path.join(plots_dir, f"spatial_difference_{split}_t{t_idx}.png") # 文件名包含 split 和 t_idx
+            #                                eval_viz.plot_spatial_difference(
+            #                                    diff_spatial[t_idx], 
+            #                                    cfg=cfg, 
+            #                                    mask=~boolean_mask, 
+            #                                    time_index=t_idx, 
+            #                                    save_path=diff_save_path,
+            #                                    title=f"盐度场空间误差"
+            #                                )
+            #                                figure_paths_split.append(diff_save_path)
+            #                      except Exception as e_inst: log.error(f"  绘制瞬时图失败 (t={t_idx}, split={split}): {e_inst}", exc_info=True)
 
-                except ImportError as viz_imp_err:
-                     log.error(f"可视化导入错误 ({split}): {viz_imp_err}")
-                     # 不标记 split 失败
-                except Exception as viz_e:
-                     log.error(f"可视化过程中捕获到异常 ({split})! 类型: {type(viz_e).__name__}, 消息: {viz_e}", exc_info=True)
-                     # 不标记 split 失败
+            #     except ImportError as viz_imp_err:
+            #          log.error(f"可视化导入错误 ({split}): {viz_imp_err}")
+            #          # 不标记 split 失败
+            #     except Exception as viz_e:
+            #          log.error(f"可视化过程中捕获到异常 ({split})! 类型: {type(viz_e).__name__}, 消息: {viz_e}", exc_info=True)
+            #          # 不标记 split 失败
 
-            elif not cfg.visualization.enabled:
-                 log.info(f"可视化在配置中被禁用 ({split})。")
-            elif num_valid_points_mask == 0:
-                 log.info(f"没有有效数据点，跳过可视化 ({split})。")
+            # elif not cfg.visualization.enabled:
+            #      log.info(f"可视化在配置中被禁用 ({split})。")
+            # elif num_valid_points_mask == 0:
+            #      log.info(f"没有有效数据点，跳过可视化 ({split})。")
 
 
             # --- 完成当前分割评估 ---
@@ -847,20 +1133,95 @@ def run_evaluation(cfg: DictConfig, rec_results: dict, all_processed_data: dict,
             evaluation_successful_for_any_split = True # 标记至少有一个分割成功
             log.info(f"--- 完成评估 {split} ---")
 
-        except Exception as e:
-            log.error(f"评估步骤 ({split}) 整体出错: {e}", exc_info=True)
-            results['evaluation_details'][split] = {"error": str(e)}
-            # split_success 保持 False
+        except Exception as e_std_eval:
+            log.error(f"标准评估分割 {split} 出错: {e_std_eval}", exc_info=True)
+            if split not in results['evaluation_details']: results['evaluation_details'][split] = {}
+            results['evaluation_details'][split]['standard_evaluation_status'] = f'Error: {e_std_eval}'
 
-    # --- 循环结束 ---
 
-    # 根据是否有任何分割成功来设置最终的 success 标志
-    results['success'] = evaluation_successful_for_any_split
-    if not results['success']:
-         log.error("所有分割的评估均失败或被跳过。")
+    # --- (最小改动) Iterative Prediction Evaluation (only for test split) ---
+    log.info("--- (评估子步骤 5b: 最小改动多步迭代预测评估 - 仅 Test 集) ---")
+    if cfg.evaluation.get("run_iterative_forecast", True):
+        try:
+            # 调用新的、加载依赖的函数
+            iter_rmse_steps = aelstm_multi_step_forecast_rmse_curve_minimal(
+                cfg=cfg,
+                ae_results=ae_results,
+                pred_results=pred_results,
+                all_processed_data=all_processed_data,
+                mask=mask, # Pass the already loaded mask
+                device=device # Pass the global device
+            )
 
-    log.info(f"--- 评估步骤完成 ---") # 移除 split 信息
+            # --- 保存和绘图 ---
+            if not np.all(np.isnan(iter_rmse_steps)): # 检查是否全为 NaN
+                iter_results_dir = os.path.join(results_dir, "iterative_forecast")
+                iter_plots_dir = os.path.join(plots_dir, "iterative_forecast")
+                os.makedirs(iter_results_dir, exist_ok=True)
+                os.makedirs(iter_plots_dir, exist_ok=True)
+
+                rmse_curve_path = os.path.join(iter_results_dir, "ae_lstm_iterative_rmse_curve.npy")
+                np.save(rmse_curve_path, iter_rmse_steps)
+                log.info(f"AE-LSTM 迭代预测 RMSE 曲线数据已保存: {rmse_curve_path}")
+
+                # Plotting (与之前的版本相同)
+                plot_save_path = os.path.join(iter_plots_dir, "ae_lstm_iterative_rmse_curve_comparison.png")
+                plt.figure(figsize=(10, 6))
+                # ... (设置中文字体的 try-except block) ...
+                try:
+                    available_font_name = 'Microsoft YaHei' # Windows 示例 (需要替换!)
+                    plt.rcParams['font.sans-serif'] = [available_font_name]
+                    plt.rcParams['axes.unicode_minus'] = False
+                except Exception as font_e:
+                    log.warning(f"设置中文字体失败: {font_e}")
+
+                valid_rmse_steps = iter_rmse_steps[~np.isnan(iter_rmse_steps)]
+                if len(valid_rmse_steps) > 0:
+                    x_steps = np.arange(1, len(valid_rmse_steps) + 1)
+                    plt.plot(x_steps, valid_rmse_steps, marker='s', color='purple', label='AE-LSTM Iterative RMSE')
+                    plt.xlim(left=0.8, right=len(valid_rmse_steps) + 0.2)
+                # ... (绘制对比基线 plt.axhline, plt.plot for SOM-HMM, SOM-LSTM, PCA-LSTM step 1) ...
+                som_hmm_rmse = cfg.evaluation.get("comparison_rmse_som_hmm", 3.0)
+                plt.axhline(y=som_hmm_rmse, color='red', linestyle='--', linewidth=1.5, label=f'SOM-HMM RMSE = {som_hmm_rmse:.2f}')
+                som_lstm_step1_rmse = cfg.evaluation.get("comparison_rmse_som_lstm_step1", 2.45)
+                plt.plot(1, som_lstm_step1_rmse, marker='^', markersize=10, linestyle='none', color='green', label=f'SOM-LSTM RMSE (Step 1) = {som_lstm_step1_rmse:.2f}')
+                pca_lstm_step1_rmse = cfg.evaluation.get("comparison_rmse_pca_lstm_step1", 1.68)
+                plt.plot(1, pca_lstm_step1_rmse, marker='o', markersize=8, linestyle='none', color='blue', label=f'PCA-LSTM RMSE (Step 1) = {pca_lstm_step1_rmse:.2f}')
+
+
+                plt.xlabel("预测步长 (天)")
+                plt.ylabel("RMSE (PSU)")
+                plt.title("迭代预测 RMSE 对比 (Test Set)")
+                plt.grid(True, alpha=0.5)
+                plt.legend()
+                plt.savefig(plot_save_path, dpi=300, bbox_inches='tight')
+                plt.close()
+                log.info(f"已生成测试集迭代预测 RMSE 对比曲线: {plot_save_path}")
+
+                # 存储结果
+                test_split_name = 'test'
+                if test_split_name not in results['evaluation_details']: results['evaluation_details'][test_split_name] = {}
+                results['evaluation_details'][test_split_name]['iterative_rmse_curve'] = iter_rmse_steps.tolist() # Save as list
+                results['evaluation_details'][test_split_name]['iterative_figures'] = [plot_save_path]
+                iterative_eval_success = True # 标记迭代评估成功
+            else:
+                log.warning("迭代预测评估计算得到的 RMSE 均为 NaN，跳过保存和绘图。")
+
+        except Exception as e_iter:
+            log.error(f"迭代预测评估失败: {e_iter}", exc_info=True)
+            # 记录错误到 results['evaluation_details']
+            test_split_name = 'test'
+            if test_split_name not in results['evaluation_details']: results['evaluation_details'][test_split_name] = {}
+            results['evaluation_details'][test_split_name]['iterative_evaluation_error'] = str(e_iter)
+
+    else:
+        log.info("根据配置跳过迭代预测评估。")
+
+    # --- Final Success Status ---
+    results['success'] = evaluation_successful_for_any_split or iterative_eval_success
+    log.info(f"--- 评估步骤完成 (最终状态: {'成功' if results['success'] else '失败'}) ---")
     return results
+
 # === 主 Pipeline 函数 ===
 @hydra.main(config_path="../conf", config_name="config", version_base=None) # 假设 conf 在上一级目录
 def run_pipeline(cfg: DictConfig) -> None:
@@ -960,7 +1321,7 @@ def run_pipeline(cfg: DictConfig) -> None:
         
     pred_results = run_lstm_prediction(cfg, ae_results, wind_results, flow_results)
     rec_results = run_salinity_reconstruction(cfg, ae_results, pred_results)
-    eval_results = run_evaluation(cfg, rec_results, all_processed_data, ae_results) # 传入 all_processed_data 和 ae_results
+    eval_results = run_evaluation(cfg, rec_results, all_processed_data, ae_results, pred_results) # 传入 all_processed_data 和 ae_results
 
     # --- 完成 ---
     success = (ae_results.get('success', False) and

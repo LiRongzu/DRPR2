@@ -19,14 +19,16 @@ if project_root not in sys.path:
 
 from src.utils.hydra_config import DrprConfig
 from src.evaluation.visualization import (
-    plot_time_series_comparison,
+    plot_comparison_and_error,
     plot_spatial_rmse,
     plot_spatial_comparison_at_timestep, # 新增：绘制特定时间点对比图
     plot_spatial_difference,            # 新增：绘制特定时间点差异图
     plot_spatial_statistic,             # 新增：绘制通用空间统计图
     calculate_correlation_map,          # 新增：计算相关性图的函数
+    plot_comparison_and_error_adjusted_style,
     generate_evaluation_report,         # 新增：生成评估报告的函数
-    plot_spatial_distribution            # 如果需要 heatmap 也导入
+    plot_spatial_distribution,            # 如果需要 heatmap 也导入
+    plot_spatial_rmse_optimized
 )
 from src.utils.model_utils import get_device_from_config  
 from src.dimensionality_reduction.som_pytorch import SOMTorch
@@ -237,38 +239,6 @@ def run_dimensionality_reduction(cfg: DictConfig) -> Dict[str, Any]:
             # 作为最后的保险：
             logger.error("未能为预测阶段生成任何 SOM BMU 输出路径。")
             # results['success'] 保持 False
-
-
-    elif method == 'pca':
-        # --- PCA 逻辑 ---
-        # ... (调用 train_and_transform_pca) ...
-        dr_results_pca = train_and_transform_pca(
-             cfg, high_dim_paths, model_path, dr_scaler_path, transformed_data_dir
-        )
-        if dr_results_pca and dr_results_pca.get('success') and 'low_dim_data_paths' in dr_results_pca:
-             results.update(dr_results_pca) # 合并 PCA 返回的结果
-             # 确保 PCA 返回的 low_dim_data_paths 格式正确
-             # PCA 通常只处理一个目标特征，格式应为 {target_field_dr: {split: path}}
-             pca_paths = dr_results_pca['low_dim_data_paths']
-             if isinstance(pca_paths, dict) and target_field_dr in pca_paths and isinstance(pca_paths[target_field_dr], dict):
-                 results['low_dim_data_paths'] = pca_paths # 格式似乎兼容
-                 results['success'] = True
-             else:
-                 logger.error(f"PCA 返回的 low_dim_data_paths 格式不正确: {pca_paths}")
-                 results['success'] = False
-        else:
-             logger.error("PCA 降维失败或未返回预期结果。")
-             results['success'] = False
-
-    elif method == 'autoencoder':
-         # --- Autoencoder 逻辑 ---
-         # 类似 PCA，需要 train_and_transform_ae 返回 {'success': True, 'low_dim_data_paths': {target_field_dr: {split: path}}, ...}
-         # ...
-         pass # Placeholder
-         # ...
-         # results['success'] = True # 如果成功
-         # results['low_dim_data_paths'] = ae_results['low_dim_data_paths']
-
     else:
         logger.error(f"未知的降维方法: {method}")
         # results['success'] is already False
@@ -775,18 +745,18 @@ def run_evaluation(cfg: DictConfig, recon_results: Dict[str, Any], dr_method: st
                  rec_mean_ts = np.nanmean(recon_flat, axis=1)
                  orig_mean_ts = np.nanmean(orig_for_comparison, axis=1)
                  ts_save_path = os.path.join(eval_output_dir, f"time_series_comparison_{split}.png")
-                 plot_time_series_comparison(rec_mean_ts, orig_mean_ts, cfg=cfg, save_path=ts_save_path,
-                                               title=f"Spatial Mean TS ({split} - {dr_method}_{pred_method})")
+                 plot_comparison_and_error_adjusted_style(rec_mean_ts, orig_mean_ts, config=cfg, save_path=ts_save_path)
 
                  if rmse_field is not None and np.any(np.isfinite(rmse_field)):
                      spatial_rmse_save_path = os.path.join(eval_output_dir, f"spatial_rmse_{split}.png")
-                     plot_spatial_rmse(rmse_field, cfg=cfg, mask=boolean_mask, save_path=spatial_rmse_save_path,
-                                       title=f"Spatial RMSE ({split} - {dr_method}_{pred_method})")
+                    #  plot_spatial_rmse(rmse_field, cfg=cfg, mask=boolean_mask, save_path=spatial_rmse_save_path,
+                    #                    title=f"Spatial RMSE ({split} - {dr_method}_{pred_method})")
+                     plot_spatial_rmse(spatial_rmse = rmse_field, cfg=cfg, mask=boolean_mask, save_path=spatial_rmse_save_path)
                  logger.info(f"  评估图表 ({split}) 已保存到: {eval_output_dir}")
 
 
             # --- (可选) 计算并绘制: 空间相关性图 (Cartopy) ---
-            if cfg.evaluation.get("calculate_correlation", False): # 添加配置开关
+            if cfg.evaluation.get("calculate_correlation", True): # 添加配置开关
                  logger.info(f"  计算空间相关性图 ({split})...")
                  try:
                      # 注意 calculate_correlation_map 需要 mask=True 表示无效
@@ -796,11 +766,11 @@ def run_evaluation(cfg: DictConfig, recon_results: Dict[str, Any], dr_method: st
                      logger.info(f"  {split} - Mean Correlation: {metrics['mean_correlation']:.6f}")
 
                      if cfg.evaluation.visualization.get("plot_spatial_correlation", True):
-                         logger.info(f"  绘制空间相关性图 (Cartopy) ({split})...")
-                         corr_save_path = os.path.join(eval_output_dir, f"spatial_correlation_{split}.png")
+                         logger.info(f"  绘制空间相关性图 (Cartopy) ")
+                         corr_save_path = os.path.join(eval_output_dir, f"spatial_correlation空间.png")
                          # plot_spatial_statistic 需要 mask=True 表示无效
                          plot_spatial_statistic(corr_map, cfg, mask, corr_save_path,
-                                                title=f"Spatial Correlation ({split} - {dr_method}_{pred_method})",
+                                                title=f"空间相关性（Spatial Correlation）",
                                                 cmap='coolwarm', vmin=-1, vmax=1, cbar_label="Correlation Coeff.")
                         #  figure_paths_split.append(corr_save_path)
 
@@ -809,7 +779,7 @@ def run_evaluation(cfg: DictConfig, recon_results: Dict[str, Any], dr_method: st
 
 
             # --- (可选) 绘制: 特定时间点的对比和差异图 (Cartopy) ---
-            if cfg.evaluation.visualization.get("plot_instantaneous", False): # 添加配置开关
+            if cfg.evaluation.visualization.get("plot_instantaneous", True): # 添加配置开关
                  time_indices_to_plot = cfg.evaluation.visualization.get("time_indices_to_plot", [0, n_recon_samples // 2, n_recon_samples - 1])
                  logger.info(f"  绘制特定时间点的空间图 ({split}, indices={time_indices_to_plot})...")
                  for t_idx in time_indices_to_plot:

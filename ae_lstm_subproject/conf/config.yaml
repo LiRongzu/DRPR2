@@ -1,0 +1,61 @@
+# AE-LSTM 子项目配置
+# 基于 Hydra
+defaults:
+  - model: lstm_ae
+  - pathways: ae_lstm_paths
+
+pipeline_name: "ae_lstm_subproject"
+
+# 模型配置
+model:
+  dimensionality_reduction:
+    autoencoder:
+      input_dim: 维度待定  # 填写实际维度
+      encoding_dim: 15
+      hidden_layers: [64, 32]
+      activation: relu
+      batch_size: 32
+      epochs: 50
+      learning_rate: 0.001
+  prediction:
+    lstm_ae:
+      sequence_length: 10
+      hidden_size: 64
+      num_layers: 2
+      dropout: 0.1
+      batch_size: 32
+      epochs: 50
+      learning_rate: 0.001
+      patience: 5
+      input_sources:
+        use_salinity: true
+        use_wind: false
+        use_flow: false
+
+# 路径配置
+paths:
+  processed_paths:
+    salinity:
+      train: data/processed/salinity_train.npy
+      val: data/processed/salinity_val.npy
+      test: data/processed/salinity_test.npy
+  scaler_paths:
+    salinity: data/scaler/salinity_scaler.npy
+  ae_model_path: models/ae_lstm/ae_model.pth
+  latent_salinity_paths:
+    train: data/latent/salinity_train_latent.npy
+    val: data/latent/salinity_val_latent.npy
+    test: data/latent/salinity_test_latent.npy
+  lstm_input_scaler_path: models/ae_lstm/lstm_input_scaler.pkl
+  latent_salinity_target_scaler_path: models/ae_lstm/latent_target_scaler.pkl
+  lstm_model_path: models/ae_lstm/lstm_model.pth
+  predicted_latent_salinity_paths:
+    train: data/predicted/latent_sal_train.npy
+    val: data/predicted/latent_sal_val.npy
+    test: data/predicted/latent_sal_test.npy
+  reconstructed_salinity_paths:
+    train: data/reconstructed/sal_train.npy
+    val: data/reconstructed/sal_val.npy
+    test: data/reconstructed/sal_test.npy
+  results_subdir: results
+  plots_subdir: plots

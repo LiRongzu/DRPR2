@@ -1,0 +1,10 @@
+# AE-LSTM 子项目依赖列表
+numpy
+hydra-core
+omegaconf
+joblib
+torch
+scikit-learn
+matplotlib
+pandas
+tqdm

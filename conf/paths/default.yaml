@@ -23,6 +23,9 @@ predicted_states_dir: ${paths.predictions_base_dir}/hmm
 predicted_dv_dir: ${paths.predictions_base_dir}/dv
 lstm_models_dir: ${paths.models_base_dir}/lstm  # <--- 在这里添加定义
 
+lstm_scaled_input_path: ${hydra:runtime.output_dir}/intermediate/lstm_input_scaled.npy
+lstm_scaled_target_path: ${hydra:runtime.output_dir}/intermediate/lstm_target_scaled.npy
+
 # --- Standard File Names (for reference or direct use) ---
 hmm_params_standard_file: ${paths.hmm_params_dir}/hmm_params.pkl
 predicted_states_standard_file: ${paths.predicted_states_dir}/predicted_salinity_states.npy

@@ -1,0 +1,62 @@
+# 继承基本配置
+defaults:
+  - config
+  - _self_
+
+# 超参数搜索配置
+hyperparameter_search:
+  study_name: "pca_lstm_search"
+  direction: "minimize"  # 最小化RMSE
+  db_storage: "sqlite:///optuna_pca_lstm.db"
+  n_trials: 50
+
+  # 各组件的搜索空间
+  search_spaces:
+    pca:
+      n_components:
+        salinity: [10, 15, 20, 30, 40]
+        wind: [5, 8, 10, 15, 20]
+        flow: [3, 5, 8, 10]
+
+    lstm:
+      hidden_size: [32, 64, 128, 256]
+      num_layers: [1, 2, 3]
+      dropout: [0.0, 0.1, 0.2, 0.3, 0.5]
+      sequence_length: [5, 10, 15, 20]
+      learning_rate: [0.001, 0.0005, 0.0001]
+      batch_size: [16, 32, 64, 128]
+      patience: [10, 20, 50, 100]
+      external_features_str: # 使用字符串表示
+        - "none"     # 代表 []
+        - "flow"     # 代表 ["flow"]
+    input_sources:
+      # 使用字符串表示不同的输入特征组合
+      input_features_str: # 使用新名字
+        - "salinity_only" # 代表 ["salinity"]
+        - "salinity_wind" # 代表 ["salinity", "wind"]
+
+  # 参数映射配置
+  pipeline:
+    param_mapping:
+      lstm_hidden_size: "model.prediction.lstm_pca.hidden_size"
+      lstm_num_layers: "model.prediction.lstm_pca.num_layers"
+      lstm_dropout: "model.prediction.lstm_pca.dropout"
+      lstm_sequence_length: "model.prediction.lstm_pca.sequence_length"
+      lstm_learning_rate: "model.prediction.lstm_pca.learning_rate"
+      lstm_batch_size: "model.prediction.lstm_pca.batch_size"
+      lstm_patience: "model.prediction.lstm_pca.patience"
+      # 注意：external_features 和 input_features 的映射需要在 python 代码中处理，这里不需要映射
+
+# 确保模型配置正确
+model:
+  dimensionality_reduction:
+    method: "pca"
+    pca:
+      target_features: ["salinity", "wind"]
+  
+  prediction:
+    method: "lstm"
+    lstm_pca:
+      target_feature: "salinity"  # 固定目标特征为盐度
+
+# 调整其他必要配置

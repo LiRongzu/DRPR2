@@ -1,0 +1,438 @@
+hyperparameter_search:
+  study_name: ae_lstm_优化
+  n_trials: 5
+  n_jobs: 1
+  direction: minimize
+  db_storage: sqlite:///optuna_studies.db
+  run_best_config: true
+  pruner:
+    type: percentile
+    percentile: 25
+    n_startup_trials: 5
+  pipeline:
+    param_mapping:
+      ae_encoding_dim: model.dimensionality_reduction.autoencoder.encoding_dim
+      ae_hidden_layer1: model.dimensionality_reduction.autoencoder.hidden_layers.0
+      ae_hidden_layer2: model.dimensionality_reduction.autoencoder.hidden_layers.1
+      ae_dropout: model.dimensionality_reduction.autoencoder.dropout_rate
+      ae_learning_rate: model.dimensionality_reduction.autoencoder.learning_rate
+      ae_batch_size: model.dimensionality_reduction.autoencoder.batch_size
+      ae_epochs: model.dimensionality_reduction.autoencoder.epochs
+      ae_activation: model.dimensionality_reduction.autoencoder.activation
+      lstm_hidden_size: model.prediction.lstm_ae.hidden_size
+      lstm_num_layers: model.prediction.lstm_ae.num_layers
+      lstm_dropout: model.prediction.lstm_ae.dropout
+      lstm_sequence_length: model.prediction.lstm_ae.sequence_length
+      lstm_learning_rate: model.prediction.lstm_ae.learning_rate
+      lstm_batch_size: model.prediction.lstm_ae.batch_size
+      lstm_patience: model.prediction.lstm_ae.patience
+      use_wind: model.prediction.input_sources.use_wind
+      use_flow: model.prediction.input_sources.use_flow
+  search_spaces:
+    ae:
+      encoding_dim:
+      - 10
+      - 15
+      - 20
+      - 30
+      hidden_layers:
+      - - 64
+        - 128
+        - 256
+      - - 32
+        - 64
+        - 128
+      dropout_rate:
+      - 0.0
+      - 0.1
+      - 0.2
+      - 0.3
+      - 0.5
+      learning_rate:
+      - 0.001
+      - 0.0005
+      - 0.0001
+      batch_size:
+      - 16
+      - 32
+      - 64
+      - 128
+      epochs:
+      - 50
+      - 100
+      - 150
+      - 200
+      activation:
+      - ReLU
+      - LeakyReLU
+      - Tanh
+      weight_decay:
+      - 0.0
+      - 1.0e-05
+      - 0.0001
+      - 0.001
+    lstm:
+      hidden_size:
+      - 32
+      - 64
+      - 128
+      - 256
+      num_layers:
+      - 1
+      - 2
+      - 3
+      dropout:
+      - 0.0
+      - 0.1
+      - 0.2
+      - 0.3
+      - 0.5
+      sequence_length:
+      - 5
+      - 10
+      - 15
+      - 20
+      learning_rate:
+      - 0.001
+      - 0.0005
+      - 0.0001
+      batch_size:
+      - 16
+      - 32
+      - 64
+      - 128
+      patience:
+      - 10
+      - 20
+      - 30
+      - 50
+      - 100
+    input_sources:
+      use_wind:
+      - true
+      - false
+      use_flow:
+      - true
+      - false
+  analysis:
+    plots_enabled: true
+    export_csv: true
+model:
+  dimensionality_reduction:
+    target_feature: salinity
+    method: som
+    som:
+      learning_rate: 0.1
+      neighborhood_size: null
+      training:
+        save_frequency: 10
+        early_stopping: true
+        patience: 5
+    pca:
+      n_components: 20
+      target_features:
+      - wind
+      - salinity
+    autoencoder:
+      encoding_dim: 17
+      hidden_layers:
+      - 64
+      - 32
+      activation: LeakyReLU
+      dropout_rate: 0.0
+      batch_size: 32
+      learning_rate: 0.0005
+      epochs: 150
+      loss_function: mse
+      weight_decay: 0.0001
+  prediction:
+    method: hmm
+    lstm:
+      input_type: bmu_rank
+      hidden_size: 64
+      num_layers: 2
+      dropout: 0.1
+      sequence_length: 10
+      batch_size: 32
+      epochs: 100
+      lr: 0.001
+      embedding_dim: 32
+      patience: 10
+      use_observation_features: true
+      observation_features:
+      - flow
+      - wind
+    lstm_pca:
+      input_features:
+      - salinity
+      target_feature: salinity
+      external_features:
+      - flow
+      sequence_length: ${model.prediction.lstm.sequence_length}
+      hidden_size: 32
+      num_layers: 2
+      patience: 100
+      learning_rate: 0.001
+      num_epochs: 100
+      batch_size: 32
+    lstm_ae:
+      output_size: ${model.dimensionality_reduction.autoencoder.encoding_dim}
+      target_feature: salinity
+      external_features:
+      - flow
+      sequence_length: 10
+      hidden_size: 64
+      num_layers: 2
+      patience: 50
+      learning_rate: 0.0005
+      epochs: 100
+      batch_size: 128
+      dropout: 0.5
+    input_sources:
+      use_salinity: true
+      use_wind: false
+      use_flow: false
+    hmm:
+      observation_features:
+      - wind
+      - flow
+      smoothing_epsilon: 1.0e-07
+      input_type: bmu_rank
+  wind_processing:
+    method: precomputed_pca
+  device:
+    use_gpu: true
+    cuda_device: cuda:0
+data:
+  paths:
+    raw_data_dir: ${project.data_dir}/raw
+    processed_data_dir: ${project.data_dir}/processed
+    distance_vectors_dir: ${project.data_dir}/processed/distance_vectors
+    salt:
+      data: ${project.data_dir}/raw/salt.npy
+      lonlat: ${project.data_dir}/raw/salt_lonlat.npy
+      grid: ${project.data_dir}/raw/salt_grid.npy
+      lonlat_grid: ${project.data_dir}/raw/salt_lonlat_grid.npy
+    mesh:
+      vertices: ${project.data_dir}/raw/vertices.npy
+      triangles: ${project.data_dir}/raw/triangles.npy
+    wind:
+      data: ${project.data_dir}/raw/wind.npy
+      lonlat: ${project.data_dir}/raw/wind_lonlat.npy
+    flow: ${project.data_dir}/raw/flow.npy
+    models:
+      som: ${project.result_dir}/som_model.pkl
+      lstm: ${project.result_dir}/lstm_model.pt
+paths:
+  hydra_run_dir: ${hydra:runtime.output_dir}
+  models_base_dir: ${paths.hydra_run_dir}/models
+  params_base_dir: ${paths.hydra_run_dir}/params
+  bmu_base_dir: ${paths.hydra_run_dir}/bmu
+  dv_base_dir: ${paths.hydra_run_dir}/dv
+  predictions_base_dir: ${paths.hydra_run_dir}/predictions
+  reconstructions_base_dir: ${paths.hydra_run_dir}/reconstructions
+  evaluation_base_dir: ${paths.hydra_run_dir}/evaluation
+  som_models_dir: ${paths.models_base_dir}/som
+  hmm_params_dir: ${paths.params_base_dir}/hmm
+  pca_models_dir: /home/lirz6/PROGRAM/DRPR/data/pca/model
+  pca_components_dir: /home/lirz6/PROGRAM/DRPR/data/pca/components
+  reconstructed_bmu_dir: ${paths.reconstructions_base_dir}/bmu
+  reconstructed_dv_dir: ${paths.reconstructions_base_dir}/dv
+  predicted_states_dir: ${paths.predictions_base_dir}/hmm
+  predicted_dv_dir: ${paths.predictions_base_dir}/dv
+  lstm_models_dir: ${paths.models_base_dir}/lstm
+  hmm_params_standard_file: ${paths.hmm_params_dir}/hmm_params.pkl
+  predicted_states_standard_file: ${paths.predicted_states_dir}/predicted_salinity_states.npy
+  project_root_dir: ${oc.env:PROJECT_ROOT,${hydra:runtime.cwd}}
+  raw_data_dir: ${paths.project_root_dir}/data/raw/mini
+  processed_data_dir: ${paths.project_root_dir}/data/processed/mini
+  mask_path: ${paths.raw_data_dir}/mask.npy
+  bmu_indices_dir: ${paths.processed_data_dir}/BMU
+  distance_vectors_dir: ${paths.processed_data_dir}/distance_vectors
+  predicted_low_dim_dir: ${hydra:run.dir}/predicted_low_dim
+  data_root_dir: ${oc.env:PROJECT_ROOT,${hydra:runtime.cwd}}
+  pca_model_dir: ${paths.data_root_dir}/data/pca/model
+  output_dir: ${hydra:runtime.output_dir}
+  models_subdir: /home/lirz6/PROGRAM/DRPR/trial_4/models
+  scalers_subdir: scalers
+  data_subdir: data
+  results_subdir: /home/lirz6/PROGRAM/DRPR/trial_4/results
+  plots_subdir: /home/lirz6/PROGRAM/DRPR/trial_4/plots
+  ae_model_path: /home/lirz6/PROGRAM/DRPR/trial_4/models/ae_model.pth
+  latent_salinity_paths:
+    train: ${paths.output_dir}/${paths.data_subdir}/latent_salinity_train.npy
+    val: ${paths.output_dir}/${paths.data_subdir}/latent_salinity_val.npy
+    test: ${paths.output_dir}/${paths.data_subdir}/latent_salinity_test.npy
+  lstm_model_path: /home/lirz6/PROGRAM/DRPR/trial_4/models/lstm_model.pth
+  lstm_input_scaler_path: ${paths.output_dir}/${paths.scalers_subdir}/lstm_input_scaler.pkl
+  latent_salinity_target_scaler_path: ${paths.output_dir}/${paths.scalers_subdir}/latent_salinity_target_scaler.pkl
+  predicted_latent_salinity_paths:
+    train: ${paths.output_dir}/${paths.data_subdir}/predicted_latent_salinity_train.npy
+    val: ${paths.output_dir}/${paths.data_subdir}/predicted_latent_salinity_val.npy
+    test: ${paths.output_dir}/${paths.data_subdir}/predicted_latent_salinity_test.npy
+  reconstructed_salinity_paths:
+    train: ${paths.output_dir}/${paths.data_subdir}/reconstructed_salinity_train.npy
+    val: ${paths.output_dir}/${paths.data_subdir}/reconstructed_salinity_val.npy
+    test: ${paths.output_dir}/${paths.data_subdir}/reconstructed_salinity_test.npy
+  evaluation_metrics_path: ${paths.output_dir}/${paths.results_subdir}/evaluation_metrics.yaml
+  evaluation_plot_timeseries_path: ${paths.output_dir}/${paths.plots_subdir}/timeseries_comp_feature_{feature_idx}.png
+  evaluation_plot_spatial_path: ${paths.output_dir}/${paths.plots_subdir}/spatial_comp_sample_{sample_idx}.png
+  processed_paths:
+    salinity:
+      train: ${paths.processed_data_dir}/train_salinity_processed.npy
+      val: ${paths.processed_data_dir}/val_salinity_processed.npy
+      test: ${paths.processed_data_dir}/test_salinity_processed.npy
+    wind_pca:
+      train: ${paths.project_root_dir}/data/pca/components/pca_components_wind_train.npy
+      val: ${paths.project_root_dir}/data/pca/components/pca_components_wind_val.npy
+      test: ${paths.project_root_dir}/data/pca/components/pca_components_wind_test.npy
+    flow:
+      train: ${paths.processed_data_dir}/train_flow_processed.npy
+      val: ${paths.processed_data_dir}/val_flow_processed.npy
+      test: ${paths.processed_data_dir}/test_flow_processed.npy
+  scaler_paths:
+    salinity: ${paths.processed_data_dir}/salinity_scaler.npy
+    wind: ${paths.processed_data_dir}/wind_scaler.npy
+    flow: ${paths.processed_data_dir}/flow_scaler.npy
+  pretrained_pca_model_path: ${paths.pca_model_dir}/pca_model_wind.pkl
+evaluation:
+  calculate_correlation: true
+  calculate_spatial_metrics: true
+  save_spatial_metrics: true
+  plot_results: true
+  compare_with_baseline: false
+  metrics:
+    compute_rmse: true
+    compute_mae: true
+    compute_temporal_mean: true
+    compute_spatial_mean: true
+    time_window: 24
+    confidence_interval: 0.95
+  spatial:
+    plot_grid: true
+    interpolation: nearest
+    colormap: YlOrRd
+    include_coordinates: true
+    grid_resolution:
+    - 50
+    - 50
+    mask_invalid: true
+  temporal:
+    window_size: 7
+    plot_moving_average: true
+    include_confidence_interval: true
+    error_band_alpha: 0.2
+    trend_line: true
+  visualization:
+    figsize:
+      time_series:
+      - 12
+      - 6
+      spatial:
+      - 10
+      - 8
+      correlation:
+      - 8
+      - 8
+    dpi: 300
+    style: seaborn
+    font:
+      family: sans-serif
+      size: 10
+    colors:
+      original: '#1f77b4'
+      reconstructed: '#ff7f0e'
+      error: '#d62728'
+    save:
+      format: png
+      quality: 95
+  save:
+    root_dir: .
+    subfolders:
+      metrics: metrics
+      figures: figures
+      data: data
+    formats:
+      metrics: npy
+      figures: png
+    file_patterns:
+      metrics: '{split}_{metric_name}.{ext}'
+      figures: '{split}_{figure_type}_{timestamp}.{ext}'
+  report:
+    generate: true
+    template: markdown
+    include_figures: true
+    include_metrics: true
+    filename: evaluation_report.md
+visualization:
+  output_format: png
+  dpi: 300
+  save_figures: true
+  show_figures: false
+  enabled: true
+  map:
+    cartopy_projection: Mercator
+    extent:
+    - 112.5
+    - 114.5
+    - 21.65
+    - 22.75
+    central_longitude: 113.5
+    data_crs: PlateCarree
+    features:
+      coastline:
+        scale: 50m
+        linewidth: 0.8
+        color: black
+        enabled: false
+      land:
+        scale: 50m
+        color: lightgray
+        enabled: true
+      ocean:
+        scale: 50m
+        color: white
+        enabled: true
+      borders:
+        scale: 50m
+        linewidth: 0.5
+        color: gray
+        enabled: false
+      rivers:
+        scale: 10m
+        color: blue
+        linewidth: 0.5
+        enabled: false
+      lakes:
+        scale: 10m
+        color: lightblue
+        enabled: false
+    gridlines:
+      draw_labels: true
+      linewidth: 0.5
+      color: gray
+      alpha: 0.5
+      linestyle: --
+      enabled: true
+    mask_color: darkgray
+    land_color: lightgray
+    water_color: white
+    figsize:
+    - 10
+    - 8
+  som:
+    show_component_planes: true
+    show_u_matrix: true
+    colormap: viridis
+  timeseries:
+    line_style: '-'
+    marker: .
+    alpha: 0.8
+    grid: true
+  colors:
+    prediction: red
+    ground_truth: blue
+    reconstruction: green
+  save:
+    dir: figures
+    format: '{name}_{timestamp}.{ext}'

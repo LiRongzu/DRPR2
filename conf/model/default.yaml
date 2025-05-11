@@ -2,7 +2,7 @@
 # --- 选择降维方法 ---
 dimensionality_reduction:
   target_feature: "salinity" # 目标特征
-  method: som # 可选项: som, pca, autoencoder
+  method: pca # 可选项: som, pca, autoencoder
   som: # 如果 method 是 som，保留 SOM 特定参数
     # map_size 现在在 training 配置中
     learning_rate: 0.1
@@ -13,8 +13,10 @@ dimensionality_reduction:
       early_stopping: true
       patience: 5
   pca: # 添加 PCA 特定参数
-     n_components: 20 # 示例值
-     target_features: ["wind", "salinity"] # 示例值
+      target_features: ["salinity", "wind"]
+      n_components_salinity: 20  # 默认值
+      n_components_wind: 10      # 默认值
+
   autoencoder: # 添加 Autoencoder 特定参数
      encoding_dim: 15 # 示例值
      hidden_layers: [64, 32] # 示例值
@@ -29,7 +31,7 @@ dimensionality_reduction:
 
 # --- 选择预测方法 ---
 prediction:
-  method: hmm # 可选项: hmm, lstm
+  method: lstm # 可选项: hmm, lstm
   lstm: # 如果 method 是 lstm，保留 LSTM 参数
       input_type: bmu_rank # 也可以是continuous_vector、 continuous、 bmu_rank
       hidden_size: 64
@@ -48,11 +50,11 @@ prediction:
       # List of features whose PCA components are used as LSTM input
       # input_features: ["wind", "salinity"] # Example: use both wind and salinity PCA components
       # input_features: ["wind"]           # Example: use only wind PCA components
-      input_features: ["salinity"]       # Example: use only salinity PCA components
-
+      input_features: ["salinity"]       # 只包含需要PCA的特征，不要包含flow
+      dropout: 0.1
       # Feature whose PCA components the LSTM should predict
       target_feature: "salinity"
-      external_features: ["flow"]
+      external_features: ["flow"]        # flow 只作为外部特征，直接输入LSTM
       # Inherit or define specific LSTM hyperparameters for this workflow
       sequence_length: ${model.prediction.lstm.sequence_length} # Inherit general LSTM param
       hidden_size: 32                   # Or define specific value
